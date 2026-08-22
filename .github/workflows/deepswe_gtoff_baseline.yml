@@ -256,8 +256,14 @@ jobs:
                   continue
               task = rj.parent.parent.name.split("__")[0]
               rew = (r.get("verifier_result") or {}).get("rewards") or {}
+              # mini-swe-agent may legitimately emit a null metadata object
+              # while still producing a complete trajectory/verifier result.
+              # Treat that as an unknown exit status; do not crash aggregation
+              # after a valid task has already run.
+              agent_result = r.get("agent_result") or {}
+              metadata = agent_result.get("metadata") or {}
               rows.append({"task": task, "reward": rew.get("reward"),
-                           "exit": (r.get("agent_result") or {}).get("metadata", {}).get("exit_status")})
+                           "exit": metadata.get("exit_status")})
           graded = [x for x in rows if x["reward"] is not None]
           solved = [x for x in graded if x["reward"] == 1.0]
           print(f"## DeepSWE v1.1 GT-off result ({len(rows)} returned / {len(graded)} graded / {len(solved)} solved)")
