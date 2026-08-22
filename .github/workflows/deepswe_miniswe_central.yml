@@ -704,6 +704,7 @@ jobs:
           AGENT_TIMEOUT_SEC=$(python -c 'import json,sys; print(int(json.load(open(sys.argv[1], encoding="utf-8"))["execution_budget_sec"]))' "deepswe-budget-$TASK.json")
           echo "AGENT_TIMEOUT_SEC=$AGENT_TIMEOUT_SEC" >> "$GITHUB_ENV"
       - name: Download the single exact bootstrap canary proof
+        if: ${{ inputs.arm != 'gt_off' }}
         uses: actions/download-artifact@v4
         with:
           name: deepswe-bootstrap-canary-${{ github.run_id }}
