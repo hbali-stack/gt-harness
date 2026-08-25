@@ -15,7 +15,7 @@ dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "ruff==0.16.0"]
 eval = ["harbor==0.20.0", "swebench==4.1.0"]
 # Workflows pin the exact treatment version.  The host-owned central runtime is
 # compatible with both the frozen 2.2.8 comparator and the current 2.3 series.
-miniswe = ["mini-swe-agent>=2.2.8,<2.4"]
+miniswe = ["mini-swe-agent==2.4.6"]
 # GroundTruth evidence engine (gt_engine/). The distribution is named
 # groundtruth-mcp (import name: groundtruth); it is not on PyPI - install from
 # the local checkout: `pip install -e D:\Groundtruth`. groundtruth-mcp declares
