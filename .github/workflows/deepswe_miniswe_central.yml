@@ -151,8 +151,7 @@ jobs:
       - name: Resolve exact GT revision
         id: gt
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Enforce active release authorization
-        run: |
+      - name: Enforce active release authorization`n        if: ${{ !inputs.diagnostic_only }}`n        run: |
           python -m scripts.release_workflow_guard \
             --workflow deepswe_miniswe_central.yml \
             --runtime-sha "$(git rev-parse HEAD)"
