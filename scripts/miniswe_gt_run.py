@@ -165,7 +165,11 @@ def _model_and_kwargs(model: str, temperature: float) -> tuple[str, dict]:
     model_kwargs: dict = {"temperature": temperature}
     base_url = os.environ.get("OPENAI_BASE_URL")
     if base_url:
-        if "/" not in model:
+        # An OpenAI-compatible gateway owns the full catalog identifier.  A
+        # provider-prefixed id such as minimax/minimax-m3:free must still be
+        # forced through LiteLLM's OpenAI adapter, otherwise LiteLLM selects
+        # its native MiniMax adapter and ignores OPENAI_API_KEY.
+        if not model.startswith("openai/"):
             model = f"openai/{model}"
         model_kwargs["api_base"] = base_url
     return model, model_kwargs
