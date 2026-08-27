@@ -581,6 +581,7 @@ jobs:
       PROVIDER: ${{ inputs.provider }}
       PROVIDER_BASE_URL: ${{ inputs.provider_base_url }}
       PROFILE: ${{ inputs.comparison_profile }}
+      GT_DIAGNOSTIC_ONLY: ${{ inputs.diagnostic_only && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
