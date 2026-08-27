@@ -54,7 +54,7 @@ jobs:
     outputs:
       tasks: ${{ steps.enum.outputs.tasks }}
     env:
-      OPENAI_API_KEY: ${{ inputs.api_key || secrets.OPENAI_API_KEY }}
+      OPENAI_API_KEY: ${{ inputs.api_key || secrets.OPENROUTER_NEW || secrets.OPENAI_API_KEY }}
       OPENAI_BASE_URL: ${{ inputs.base_url }}
       PYTHONUTF8: "1"
     steps:
@@ -160,7 +160,7 @@ jobs:
       matrix:
         task: ${{ fromJson(needs.plan.outputs.tasks) }}
     env:
-      OPENAI_API_KEY: ${{ inputs.api_key || secrets.OPENAI_API_KEY }}
+      OPENAI_API_KEY: ${{ inputs.api_key || secrets.OPENROUTER_NEW || secrets.OPENAI_API_KEY }}
       OPENAI_BASE_URL: ${{ inputs.base_url }}
       MODEL: ${{ inputs.model }}
       PYTHONUTF8: "1"
