@@ -625,7 +625,7 @@ jobs:
           # Download public release assets directly.  Calling `gh release
           # download` independently from 20 matrix jobs requires a GitHub API
           # credential and is vulnerable to per-job 401/rate-limit failures.
-          release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/gt-retrieval-runtime-v1"
+          release_base="https://github.com/harneet2512/gt-harness/releases/download/gt-retrieval-runtime-v1"
           curl --fail --location --retry 3 --retry-all-errors \
             "$release_base/model.onnx" --output "$model_dir/model.onnx"
           curl --fail --location --retry 3 --retry-all-errors \
