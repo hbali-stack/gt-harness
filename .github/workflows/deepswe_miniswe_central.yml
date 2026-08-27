@@ -400,7 +400,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || secrets.OPENROUTER_NEW }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
       TOKENROUTER_API_KEY: ${{ secrets.TOKENROUTER_API_KEY }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -569,7 +569,7 @@ jobs:
       matrix:
         task: ${{ fromJson(needs.plan.outputs.tasks) }}
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || secrets.OPENROUTER_NEW }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
       TOKENROUTER_API_KEY: ${{ secrets.TOKENROUTER_API_KEY }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
