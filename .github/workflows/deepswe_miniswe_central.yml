@@ -126,6 +126,7 @@ jobs:
       TASK_IDS: ${{ inputs.task_ids }}
       TASK_COUNT: ${{ inputs.task_count }}
       REQUESTED_PARALLEL: ${{ inputs.parallel }}
+      DIAGNOSTIC_ONLY: ${{ inputs.diagnostic_only }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -189,7 +190,7 @@ jobs:
           if not 1 <= target <= 113:
               raise SystemExit(f"TASK_COUNT must be between 1 and 113, got {target}")
           explicit = [x.strip() for x in os.environ.get("TASK_IDS", "").split(",") if x.strip()]
-          if target == 20:
+          if target == 20 and os.environ.get("DIAGNOSTIC_ONLY") != "true":
               frozen_path = Path(
                   "docs/benchmarks/GT_FINAL_20_TASK_OUTCOME_PREDICTION_2026-08-20_V20.json"
               )
