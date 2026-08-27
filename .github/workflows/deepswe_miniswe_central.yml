@@ -109,7 +109,9 @@ env:
   SNOWFLAKE_TOKENIZER_SHA256: 91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854
   GT_DENSE_INTRA_OP_THREADS: "4"
   GT_DENSE_INTER_OP_THREADS: "1"
-  GT_OPENROUTER_PROVIDER_ONLY: minimax
+  # Set dynamically for models that require a provider restriction.  Do not
+  # force MiniMax routing for unrelated OpenRouter models.
+  GT_OPENROUTER_PROVIDER_ONLY: ""
   GT_OPENROUTER_DATA_COLLECTION: allow
 
 jobs:
@@ -439,7 +441,8 @@ jobs:
                   model = f"openai/{model}"
               export("GT_LITELLM_MODEL", model)
               export("OPENAI_BASE_URL", os.environ["PROVIDER_BASE_URL"])
-              export("GT_OPENROUTER_PROVIDER_ONLY", "minimax")
+              provider_only = "minimax" if "minimax" in model.lower() else ""
+              export("GT_OPENROUTER_PROVIDER_ONLY", provider_only)
               export("GT_OPENROUTER_DATA_COLLECTION", "allow")
           elif provider == "tokenrouter":
               if not model.startswith("openai/"):
@@ -537,14 +540,14 @@ jobs:
     name: Task progress
     needs: [plan]
     if: always()
-    # The monitor is observability only.  Its wall-clock backstop must never
-    # turn a completed task matrix into a cancelled benchmark workflow.
-    continue-on-error: true
     uses: ./.github/workflows/task_progress.yml
     with:
       expected_tasks_json: ${{ needs.plan.outputs.tasks }}
       task_job_regex: '^run \(.+\)$'
       checkpoint_every: "20"
+      # Exit before the GitHub hard timeout; this monitor must not cancel the
+      # benchmark workflow while queued task jobs continue.
+      monitor_timeout_minutes: "330"
     secrets: inherit
 
   run:
