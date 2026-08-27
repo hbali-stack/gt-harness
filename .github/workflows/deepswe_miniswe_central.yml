@@ -149,8 +149,7 @@ jobs:
       - name: Resolve exact GT revision
         id: gt
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Enforce active release authorization
-        run: |
+      - name: Enforce active release authorization`n        if: ${{ !inputs.diagnostic_only }}`n        run: |
           python -m scripts.release_workflow_guard \
             --workflow deepswe_miniswe_central.yml \
             --runtime-sha "$(git rev-parse HEAD)"
@@ -540,8 +539,772 @@ jobs:
     uses: ./.github/workflows/task_progress.yml
     with:
       expected_tasks_json: ${{ needs.plan.outputs.tasks }}
-      task_job_regex: '^run \(.+\)$'
-    secrets: inherit
+      task_job_regex: '^run \\(.+\\)    secrets: inherit
+
+  run:
+    needs: [plan, baseline, provider_free, bootstrap_canary]
+    if: ${{ always() && (inputs.arm == 'gt_off' || (needs.provider_free.result == 'success' && needs.bootstrap_canary.result == 'success' && (inputs.diagnostic_only || needs.baseline.result == 'success'))) }}
+    runs-on: ubuntu-latest
+    # DeepSWE's published task contract gives the agent 5400 seconds.  Keep
+    # the job backstop aligned with the original full-matrix workflow rather
+    # than imposing a GT-specific 120-minute ceiling.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      # The requested cohort is genuinely 20-way parallel.  Provider-specific
+      # throttling is an infrastructure concern and must be recorded per task,
+      # not hidden by silently shrinking the cohort.
+      max-parallel: 20
+      matrix:
+        task: ${{ fromJson(needs.plan.outputs.tasks) }}
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY || secrets.OPENROUTER_NEW }}
+      TOKENROUTER_API_KEY: ${{ secrets.TOKENROUTER_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MODEL: ${{ inputs.model }}
+      TASK: ${{ matrix.task }}
+      STEP_LIMIT: ${{ inputs.step_limit }}
+      PROVIDER: ${{ inputs.provider }}
+      PROVIDER_BASE_URL: ${{ inputs.provider_base_url }}
+      PROFILE: ${{ inputs.comparison_profile }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Bind receipts to the exact checked-out GT revision
+        run: echo "GT_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Checkout pinned DeepSWE task set
+        uses: actions/checkout@v4
+        with:
+          repository: datacurve-ai/deep-swe
+          ref: 435ee89ec2f2e2289f33b0da4f992f0b7b7266b9
+          path: deepswe-bench
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vendor/gt-index-src/go.mod
+          cache-dependency-path: vendor/gt-index-src/go.sum
+      - name: Build current GT index with FTS5
+        working-directory: vendor/gt-index-src
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go build -tags sqlite_fts5 -o "$RUNNER_TEMP/gt-index" ./cmd/gt-index/
+          chmod +x "$RUNNER_TEMP/gt-index"
+          echo "GT_INDEX_BINARY=$RUNNER_TEMP/gt-index" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/gt-index" -h >/dev/null 2>&1 || true
+      - name: Install current central runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[retrieval]' "mini-swe-agent==2.2.8" "harbor==0.20.0" "datacurve-pier==0.3.1" pytest pytest-asyncio \
+            vendor/groundtruth_mcp-*.whl
+          test "$(python -c 'import importlib.metadata as m; print(m.version("datacurve-pier"))')" = "0.3.1"
+      - name: Provision and verify pinned Snowflake ONNX backend
+        run: |
+          set -euo pipefail
+          model_dir="$RUNNER_TEMP/snowflake-arctic-embed-m"
+          mkdir -p "$model_dir"
+          # Download public release assets directly.  Calling `gh release
+          # download` independently from 20 matrix jobs requires a GitHub API
+          # credential and is vulnerable to per-job 401/rate-limit failures.
+          release_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/gt-retrieval-runtime-v1"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$release_base/model.onnx" --output "$model_dir/model.onnx"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$release_base/tokenizer.json" --output "$model_dir/tokenizer.json"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "$release_base/manifest.json" --output "$model_dir/manifest.json"
+          echo "$SNOWFLAKE_MODEL_SHA256  $model_dir/model.onnx" | sha256sum -c -
+          echo "$SNOWFLAKE_TOKENIZER_SHA256  $model_dir/tokenizer.json" | sha256sum -c -
+          MODEL_DIR="$model_dir" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from gt_engine.snowflake_onnx import SnowflakeOnnxDenseBackend
+          root = Path(os.environ["MODEL_DIR"])
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert manifest.get("model") == "Snowflake/snowflake-arctic-embed-m"
+          assert manifest.get("revision") == os.environ["SNOWFLAKE_MODEL_REVISION"]
+          assert manifest.get("inference_api") is False
+          backend = SnowflakeOnnxDenseBackend.from_directory(root)
+          q, d = backend.embed_query("repository implementation"), backend.embed_documents(("def implementation(): pass",))[0]
+          assert q and d and not (backend.receipt().get("network_calls") or backend.receipt().get("provider_calls"))
+          Path("dense-backend-proof.json").write_text(json.dumps({"identity": backend.identity, "available": True, "receipt": backend.receipt()}, indent=2) + "\n", encoding="utf-8")
+          print(backend.identity)
+          PY
+          echo "MODEL_DIR=$model_dir" >> "$GITHUB_ENV"
+      - name: Prove current provider-free runtime before task execution
+        run: |
+          set -euo pipefail
+          # GITHUB_ENV is available to later steps, but make the exact
+          # source-built binary explicit for every subprocess in this proof
+          # step.  The strict pytest child must not fall back to the stale
+          # wheel/cache binary.
+          export GT_INDEX_BINARY="$RUNNER_TEMP/gt-index"
+          test -x "$GT_INDEX_BINARY"
+          python scripts/verify_gt_index_runtime.py
+          python scripts/central_readiness_audit.py
+          python scripts/central_pre_smoke_gate.py
+      - name: Sanitize provider credentials
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          names = (
+              "OPENROUTER_API_KEY",
+              "TOKENROUTER_API_KEY",
+              "DEEPSEEK_API_KEY",
+              "OPENAI_API_KEY",
+              "ANTHROPIC_API_KEY",
+          )
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              for name in names:
+                  raw = os.environ.get(name) or ""
+                  if not raw:
+                      continue
+                  clean = raw.replace("\ufeff", "").strip()
+                  if not clean.isascii():
+                      raise SystemExit(f"{name} contains non-ASCII header data")
+                  print(f"::add-mask::{clean}")
+                  out.write(f"{name}={clean}\n")
+          PY
+          case "$MODEL" in
+            openai/*) executor_model="$MODEL" ;;
+            *) executor_model="openai/$MODEL" ;;
+          esac
+          echo "GT_LITELLM_MODEL=${executor_model}" >> "$GITHUB_ENV"
+          if [ "${PROVIDER:-configured}" = "openrouter" ]; then
+            # Force Mini-SWE's actual model builder onto OpenRouter.  Merely
+            # supplying OPENROUTER_API_KEY is insufficient: a model string
+            # containing `deepseek/` otherwise selects LiteLLM's native
+            # DeepSeek provider and bypasses OpenRouter.
+            echo "OPENAI_BASE_URL=${PROVIDER_BASE_URL}" >> "$GITHUB_ENV"
+            echo "OPENAI_API_KEY=${OPENROUTER_API_KEY}" >> "$GITHUB_ENV"
+          elif [ "${PROVIDER:-configured}" = "tokenrouter" ]; then
+            echo "OPENAI_BASE_URL=${PROVIDER_BASE_URL}" >> "$GITHUB_ENV"
+            echo "OPENAI_API_KEY=${TOKENROUTER_API_KEY}" >> "$GITHUB_ENV"
+          elif [ "${PROVIDER:-configured}" = "deepseek" ]; then
+            echo "OPENAI_BASE_URL=${PROVIDER_BASE_URL}" >> "$GITHUB_ENV"
+            echo "OPENAI_API_KEY=${DEEPSEEK_API_KEY}" >> "$GITHUB_ENV"
+          fi
+      - name: Resolve exact DeepSWE task budget
+        run: |
+          set -euo pipefail
+          python scripts/resolve_harbor_budget.py \
+            --task-config "deepswe-bench/tasks/$TASK/task.toml" \
+            --multiplier 1.0 --output "deepswe-budget-$TASK.json"
+          AGENT_TIMEOUT_SEC=$(python -c 'import json,sys; print(int(json.load(open(sys.argv[1], encoding="utf-8"))["execution_budget_sec"]))' "deepswe-budget-$TASK.json")
+          echo "AGENT_TIMEOUT_SEC=$AGENT_TIMEOUT_SEC" >> "$GITHUB_ENV"
+      - name: Download the single exact bootstrap canary proof
+        if: ${{ inputs.arm != 'gt_off' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: deepswe-bootstrap-canary-${{ github.run_id }}
+          path: .
+      - name: Run current central Mini-SWE on DeepSWE task
+        run: |
+          set -uo pipefail
+          mkdir -p results/deepswe
+          TREATMENT_CONTRACT="$RUNNER_TEMP/gt-treatment-runtime.json"
+          python -m scripts.render_treatment_agent_args \
+            --release-manifest eval/release/active_release.json \
+            --source-sha "$(git rev-parse HEAD)" \
+            --max-steps "$STEP_LIMIT" \
+            --output "$TREATMENT_CONTRACT"
+          if [ "$PROFILE" = "persistent_state_only" ]; then
+            python -c 'import hashlib,json,pathlib,sys; p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text()); d["agent_kwargs"].update({"dense_fallback_only":False,"enable_adaptive_validation_timeout":False,"enable_completion_controller":False,"enable_context_compaction":False,"enable_progress_control":False,"enable_shadow_submit_gate":False,"preflight_mode":"shadow","gt_task_evidence_budget_tokens":1200,"gt_task_critical_reserve_tokens":512,"enable_replay_capture":True}); m=dict(d); m.pop("contract_sha256",None); d["contract_sha256"]=hashlib.sha256(json.dumps(m,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8","surrogatepass")).hexdigest(); p.write_text(json.dumps(d,indent=2,sort_keys=True)+"\n")' "$TREATMENT_CONTRACT"
+          fi
+          run_task() {
+            PROFILE_ARGS=()
+            if [ "$PROFILE" = "baseline" ]; then
+              PROFILE_ARGS=(
+                --ak integration_mode=off --ak policy_mode=off
+                --ak preflight_mode=off
+                --ak enable_all_features=false --ak enable_submit_readiness=false
+                --ak enable_repository_intelligence=false --ak require_graph_ready=false
+                --ak enable_lint=false --ak enable_feature_guidance=false
+                --ak enable_context_frontier=false --ak enable_preemptive_retrieval=false
+                --ak enable_persistent_execution_state=false
+                --ak enable_context_compaction=false
+                --ak enable_completion_controller=false
+                --ak enable_progress_control=false
+                --ak enable_adaptive_validation_timeout=false
+                --ak enable_decision_sufficiency=false
+              )
+            elif [ "$PROFILE" = "persistent_state_only" ]; then
+              # Match the preceding central comparison exactly, adding only
+              # the graph-first persistent execution state mechanism.
+              PROFILE_ARGS=(
+                --ak treatment_profile=central_relational_v2
+                --ak integration_mode=active --ak policy_mode=certified_active
+                --ak preflight_mode=shadow
+                --ak enable_all_features=true --ak enable_submit_readiness=true
+                --ak enable_repository_intelligence=true --ak require_graph_ready=true
+                --ak repository_initial_index_timeout_sec=60
+                --ak repository_refresh_timeout_sec=60
+                --ak enable_lint=true --ak enable_feature_guidance=true
+                --ak enable_context_frontier=true --ak enable_preemptive_retrieval=true
+                --ak enable_persistent_execution_state=true
+                --ak persistent_state_bootstrap_timeout_sec=45
+                --ak persistent_state_bootstrap_input_tokens=2000
+                --ak persistent_state_bootstrap_output_tokens=512
+                --ak persistent_state_context_tokens=512
+                --ak gt_request_token_budget=1200
+                --ak preemptive_retrieval_model_dir="$MODEL_DIR"
+                --ak enable_context_compaction=false
+                --ak enable_completion_controller=false
+                --ak enable_progress_control=false
+                --ak enable_adaptive_validation_timeout=false
+                --ak enable_decision_sufficiency=true
+              )
+            elif [ "$PROFILE" = "certified_full" ]; then
+              PROFILE_ARGS=(
+                --ak treatment_profile=central_relational_v2
+                --ak integration_mode=active --ak policy_mode=certified_active
+                --ak preflight_mode=shadow
+                --ak enable_all_features=true --ak enable_submit_readiness=true
+                --ak enable_repository_intelligence=true --ak require_graph_ready=true
+                --ak repository_initial_index_timeout_sec=60
+                --ak repository_refresh_timeout_sec=60
+                --ak enable_lint=true --ak enable_feature_guidance=true
+                --ak enable_context_frontier=true --ak enable_preemptive_retrieval=true
+                --ak enable_persistent_execution_state=true
+                --ak persistent_state_bootstrap_timeout_sec=45
+                --ak persistent_state_bootstrap_input_tokens=2000
+                --ak persistent_state_bootstrap_output_tokens=512
+                --ak persistent_state_context_tokens=512
+                --ak gt_request_token_budget=1200
+                --ak preemptive_retrieval_model_dir="$MODEL_DIR"
+                --ak enable_context_compaction=true
+                --ak enable_completion_controller=true
+                --ak enable_progress_control=true
+                --ak enable_adaptive_validation_timeout=true
+                --ak enable_shadow_submit_gate=true
+                --ak enable_decision_sufficiency=true
+              )
+            else
+              echo "::error::unknown comparison profile: $PROFILE"
+              return 2
+            fi
+            if [ "$PROFILE" != "baseline" ]; then
+              # The signed treatment contract is authoritative.  Do not let
+              # this workflow's historical profile shorthand diverge from
+              # the exact runtime arguments audited by the release gate.
+              mapfile -t PROFILE_ARGS < <(
+                python -m scripts.render_treatment_agent_args \
+                  --emit-harbor-args "$TREATMENT_CONTRACT"
+              )
+            fi
+            timeout --signal=TERM --kill-after=30s "${AGENT_TIMEOUT_SEC}s" pier run -p deepswe-bench/tasks --include-task-name "$TASK" \
+              --agent-import-path eval.pier_gt_adapter:PierMiniSweCentralAgent \
+              -m "$MODEL" -o results/deepswe \
+              --job-name "deepswe-central-${GITHUB_RUN_ID}-${TASK}" \
+              --agent-timeout-multiplier 1.0 -n 1 -y \
+              "${PROFILE_ARGS[@]}" \
+              --ak enable_replay_capture=true \
+              --ak treatment_runtime_contract_path="$TREATMENT_CONTRACT" \
+              --ak preemptive_retrieval_model_dir="$MODEL_DIR" \
+              --ak enable_task_start_advisory=false \
+              --ak step_limit="$STEP_LIMIT" \
+              --ak execution_budget_sec="$AGENT_TIMEOUT_SEC"
+          }
+          set +e
+          run_task 2>&1 | tee deepswe-task.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ] \
+            && ! find results/deepswe -name central_receipt.json -print -quit | grep -q . \
+            && ! find results/deepswe -name provider_query_started.json -print -quit | grep -q .; then
+            echo "infra-only retry: no GT provider query started"
+            # Docker registry throttles are transient infrastructure failures;
+            # give the registry window time to clear before retrying.  No model
+            # request has started at this point.  Use two spaced retries because
+            # hosted-runner egress IPs can share a Docker Hub quota window.
+            sleep 120
+            mkdir -p results/deepswe-infra-attempt-1
+            find results/deepswe -mindepth 1 -maxdepth 1 -exec mv -t results/deepswe-infra-attempt-1 -- {} +
+            set +e
+            run_task 2>&1 | tee -a deepswe-task.log
+            status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -ne 0 ] \
+              && ! find results/deepswe -name central_receipt.json -print -quit | grep -q . \
+              && ! find results/deepswe -name provider_query_started.json -print -quit | grep -q .; then
+              echo "infra-only retry 2: no GT provider query started"
+              sleep 180
+              mkdir -p results/deepswe-infra-attempt-2
+              find results/deepswe -mindepth 1 -maxdepth 1 -exec mv -t results/deepswe-infra-attempt-2 -- {} +
+              set +e
+              run_task 2>&1 | tee -a deepswe-task.log
+              status=${PIPESTATUS[0]}
+              set -e
+            fi
+          fi
+          exit "$status"
+      - name: Upload task evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepswe-central-${{ github.run_id }}-${{ matrix.task }}
+          path: |
+            results/deepswe/
+            results/deepswe-infra-attempt-1/
+            results/deepswe-infra-attempt-2/
+            dense-backend-proof.json
+            provider-route-proof.json
+            deepswe-budget-${{ matrix.task }}.json
+            deepswe-task.log
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, baseline, provider_free, bootstrap_canary, run]
+    if: ${{ always() && needs.plan.result == 'success' && needs.run.result != 'skipped' && (inputs.arm == 'gt_off' || (needs.provider_free.result == 'success' && needs.bootstrap_canary.result == 'success' && (inputs.diagnostic_only || needs.baseline.result == 'success'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install current audit runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[retrieval]' pytest
+      - name: Download task evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deepswe-central-${{ github.run_id }}-*
+          path: tasks
+          merge-multiple: false
+      - name: Download approved frozen baseline
+        if: ${{ inputs.arm == 'gt_on' && !inputs.diagnostic_only }}
+        uses: actions/download-artifact@v4
+        with:
+          name: deepswe-baseline-approved-${{ github.run_id }}
+          path: baseline-approved
+      - name: Stage approved baseline
+        if: ${{ inputs.arm == 'gt_on' && !inputs.diagnostic_only }}
+        run: cp baseline-approved/DEEPSWE_BASELINE_RESULTS.json DEEPSWE_BASELINE_RESULTS.json
+      - name: Merge receipts, outcomes, and delivery metrics
+        env:
+          EXPECTED: ${{ needs.plan.outputs.tasks }}
+          RUN_ID: ${{ github.run_id }}
+          BENCH_SHA: ${{ needs.plan.outputs.bench_sha }}
+          GT_SHA: ${{ needs.plan.outputs.gt_sha }}
+          MODEL: ${{ inputs.model }}
+          PROVIDER: ${{ inputs.provider }}
+          PROVIDER_BASE_URL: ${{ inputs.provider_base_url }}
+          STEP_LIMIT: ${{ inputs.step_limit }}
+          PROFILE: ${{ inputs.comparison_profile }}
+          ARM: ${{ inputs.arm }}
+          DIAGNOSTIC_ONLY: ${{ inputs.diagnostic_only && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from gt_engine.delivery_audit import audit_provider_deliveries
+          from gt_engine.intervention_chain import audit_intervention_artifacts
+          from gt_engine.runtime_gate import audit_runtime_receipt
+          from scripts.central_release_gate import audit_treatment_runtime
+
+          expected = json.loads(os.environ.get("EXPECTED") or "[]")
+          rows, missing, setup_overheads = [], [], []
+
+          def classify_outcome(rewards, exception):
+              if rewards.get("reward") == 1 and not exception:
+                  return "PASS"
+              if rewards.get("reward") == 0 and not exception:
+                  return "FAIL"
+              text = json.dumps(exception, ensure_ascii=False).lower() if exception else ""
+              if any(marker in text for marker in (
+                  "timeout", "timed out", "deadline exceeded",
+                  "environmentstarttimeout", "execution_budget",
+              )):
+                  return "INFRA_TIMEOUT"
+              if any(marker in text for marker in (
+                  "oomkilled", "docker", "container", "registry",
+                  "pier_run_fail", "environmentstart", "connection",
+                  "internalservererror", "provider unavailable",
+              )):
+                  return "INFRA_FAILURE"
+              return "UNKNOWN"
+          for task in expected:
+              root = Path("tasks") / f"deepswe-central-{os.environ['RUN_ID']}-{task}"
+              receipts = list(root.rglob("central_receipt.json"))
+              results = list(root.rglob("result.json"))
+              provider_proofs = list(root.rglob("provider-route-proof.json"))
+              if not receipts or not results or len(provider_proofs) != 1:
+                  missing.append(task); continue
+              receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+              parsed_results = [json.loads(p.read_text(encoding="utf-8")) for p in results]
+              # Harbor writes an aggregate result.json beside the trial
+              # directory.  Outcome fields live in the nested trial result;
+              # selecting the aggregate yields a None verifier_result.
+              result = next(
+                  (item for item in parsed_results if isinstance(item, dict) and
+                   ("verifier_result" in item or "exception_info" in item)),
+                  parsed_results[-1],
+              )
+              metrics = receipt.get("metrics") or {}
+              intel = receipt.get("repository_intelligence") or {}
+              _, failures, totals = audit_provider_deliveries(receipt, task=task)
+              if (os.environ.get("ARM") or "gt_on") == "gt_off":
+                  runtime_failures, runtime_gate, treatment_failures = [], {}, []
+                  artifact_failures, artifact_summary = [], {}
+              else:
+                  runtime_failures, runtime_gate = audit_runtime_receipt(receipt, task=task)
+                  artifact_failures, artifact_summary = audit_intervention_artifacts(
+                      receipt,
+                      artifact_root=receipts[0].parent,
+                  )
+                  treatment_checks = audit_treatment_runtime(
+                      receipt,
+                      label=task,
+                      profile=os.environ.get("PROFILE") or "certified_full",
+                  )
+                  treatment_failures = [
+                      failure
+                      for check in treatment_checks
+                      for failure in check.failures
+                  ]
+                  treatment_failures.extend(
+                      f"{task}:artifact:{failure}" for failure in artifact_failures
+                  )
+              rewards = (result.get("verifier_result") or {}).get("rewards") or {}
+              exception = result.get("exception_info")
+              solved = rewards.get("reward") == 1 and not exception
+              outcome_class = classify_outcome(rewards, exception)
+              preemptive = receipt.get("preemptive_retrieval") or {}
+              dense_backend = preemptive.get("dense_backend") or {}
+              provider_proof = json.loads(
+                  provider_proofs[0].read_text(encoding="utf-8")
+              )
+              setup_overheads.append(provider_proof.get("benchmark_setup_overhead") or {})
+              provider_route = receipt.get("provider_route") or {}
+              configured_model = str(os.environ.get("MODEL") or "").strip()
+              effective_model = (
+                  configured_model
+                  if configured_model.startswith("openai/")
+                  else f"openai/{configured_model}"
+              )
+              route_common = bool(
+                  provider_proof.get("requested_model")
+                  == effective_model
+                  and provider_route.get("model")
+                  == effective_model
+                  and provider_route.get("credential_in_receipt") is False
+                  and provider_route.get("retry_policy")
+                  == "provider_once_no_retry"
+              )
+              if os.environ.get("PROVIDER") == "tokenrouter":
+                  provider_route_valid = bool(
+                      route_common
+                      and provider_proof.get("requested_provider") == "tokenrouter"
+                      and provider_proof.get("catalog_model_confirmed") is True
+                      and provider_route.get("api_base")
+                      == os.environ["PROVIDER_BASE_URL"]
+                      and not (provider_route.get("thinking_mode") or "")
+                      and provider_proof.get("thinking_mode") == "disabled"
+                      and provider_proof.get("forced_tool") == "select_catalog"
+                      and not (provider_route.get("provider_policy") or {})
+                  )
+              elif os.environ.get("PROVIDER") == "deepseek":
+                  route_common = bool(
+                      provider_proof.get("requested_model")
+                      == "openai/deepseek-v4-flash"
+                      and provider_route.get("model")
+                      == "openai/deepseek-v4-flash"
+                      and provider_route.get("credential_in_receipt") is False
+                      and provider_route.get("retry_policy")
+                      == "provider_once_no_retry"
+                  )
+                  provider_route_valid = bool(
+                      route_common
+                      and provider_proof.get("requested_provider") == "deepseek_native"
+                      and provider_route.get("api_base")
+                      == os.environ["PROVIDER_BASE_URL"]
+                      and not (provider_route.get("thinking_mode") or "")
+                      and provider_proof.get("thinking_mode") == "disabled"
+                      and provider_proof.get("forced_tool") == "select_catalog"
+                      and not (provider_route.get("provider_policy") or {})
+                  )
+              else:
+                  provider_route_valid = bool(
+                      route_common
+                      and provider_proof.get("requested_provider") == "deepseek"
+                      and provider_proof.get("allow_fallbacks") is False
+                      and provider_proof.get("require_parameters") is True
+                      and provider_route.get("api_base")
+                      == os.environ["PROVIDER_BASE_URL"]
+                      and (provider_route.get("provider_policy") or {}).get("only")
+                      == ["deepseek"]
+                  )
+              response_identity = receipt.get("provider_response_identity") or {}
+              product_census = receipt.get("product_mechanism_census") or {}
+              prompt_identity = receipt.get("provider_prompt_identity") or {}
+              workspace_prompt_contract = str(
+                  (receipt.get("workspace_prompt") or {}).get("contract") or ""
+              )
+              executor_identity = response_identity.get("executor") or {}
+              bootstrap_identity = response_identity.get("bootstrap") or {}
+              bootstrap = (receipt.get("persistent_execution_state") or {}).get("bootstrap") or {}
+              expected_response_model = str(provider_proof.get("response_model") or "")
+              expected_response_provider = str(provider_proof.get("response_provider") or "")
+              expected_fingerprint = str(provider_proof.get("system_fingerprint") or "")
+              bootstrap_identity_valid = bool(
+                  (os.environ.get("ARM") or "gt_on") == "gt_off"
+                  or int(bootstrap.get("provider_calls") or 0) == 0
+                  or (
+                      bootstrap_identity.get("model") == expected_response_model
+                      and bootstrap_identity.get("provider") == expected_response_provider
+                      and (
+                          not expected_fingerprint
+                          or bootstrap_identity.get("system_fingerprint")
+                          == expected_fingerprint
+                      )
+                  )
+              )
+              response_identity_valid = bool(
+                  expected_response_model
+                  and expected_response_provider
+                  and executor_identity.get("response_count")
+                  and executor_identity.get("stable_model_identity") is True
+                  and executor_identity.get("models") == [expected_response_model]
+                  and executor_identity.get("stable_provider_identity") is True
+                  and executor_identity.get("providers") == [expected_response_provider]
+                  and bootstrap_identity_valid
+                  and (
+                      not expected_fingerprint
+                      or (
+                          executor_identity.get("stable_fingerprint_identity") is True
+                          and executor_identity.get("system_fingerprints")
+                          == [expected_fingerprint]
+                      )
+                  )
+              )
+              rows.append({"task": task, "solved": solved, "outcome_class": outcome_class,
+                           "rewards": rewards,
+                           "exception": exception,
+                           "integration_mode": receipt.get("integration_mode"),
+                           "graph_status": intel.get("substrate_status") or intel.get("status"),
+                           "graph_applicability": intel.get("applicability"),
+                           "graph_failures": intel.get("failures") or [],
+                           "dense_available": bool(dense_backend.get("available")),
+                           "provider_route_valid": provider_route_valid,
+                           "provider_response_identity_valid": response_identity_valid,
+                           "provider_response_identity": response_identity,
+                           "product_mechanism_census": product_census,
+                           "system_prompt_sha256": prompt_identity.get("system_prompt_sha256"),
+                           "task_prompt_sha256": prompt_identity.get("task_prompt_sha256"),
+                           "tool_schema_sha256": prompt_identity.get("tool_schema_sha256"),
+                           "executor_response_models": (response_identity.get("executor") or {}).get("models", []),
+                           "executor_response_providers": (response_identity.get("executor") or {}).get("providers", []),
+                           "executor_system_fingerprints": (response_identity.get("executor") or {}).get("system_fingerprints", []),
+                           "provider_route_proof": provider_proof,
+                           "workspace_prompt_contract": workspace_prompt_contract,
+                           "provider_delivery_count": totals.get("delivery_count"),
+                           "provider_delivery_chars": totals.get("visible_chars"),
+                           "delivery_failures": failures,
+                           "runtime_gate_failures": runtime_failures,
+                           "runtime_gate": runtime_gate,
+                           "artifact_integrity_failures": artifact_failures,
+                           "artifact_integrity": artifact_summary,
+                           "treatment_release_failures": treatment_failures,
+                           "provider_calls": metrics.get("api_calls"),
+                           "assistant_steps": metrics.get("assistant_steps"),
+                           "decision_actions": metrics.get("decision_actions"),
+                           "effective_actions": metrics.get("effective_task_actions"),
+                           "actions": metrics.get("actions"),
+                           "total_tokens": metrics.get("total_tokens"),
+                           "provider_cost_usd": metrics.get("provider_cost_usd"),
+                           "total_gt_context_chars": metrics.get("total_gt_context_chars_added"),
+                           "persistent_state_enabled": metrics.get("persistent_state_enabled"),
+                           "persistent_state_initialized": metrics.get("persistent_state_initialized"),
+                           "persistent_state_initial_retrieval_calls": metrics.get("persistent_state_initial_retrieval_calls"),
+                           "persistent_state_initial_retrieval_latency_ms": metrics.get("persistent_state_initial_retrieval_latency_ms"),
+                           "persistent_state_bootstrap_calls": metrics.get("persistent_state_bootstrap_calls"),
+                           "persistent_state_bootstrap_input_tokens": metrics.get("persistent_state_bootstrap_input_tokens"),
+                           "persistent_state_bootstrap_output_tokens": metrics.get("persistent_state_bootstrap_output_tokens"),
+                           "persistent_state_bootstrap_latency_ms": metrics.get("persistent_state_bootstrap_latency_ms"),
+                           "persistent_state_context_compilations": metrics.get("persistent_state_context_compilations"),
+                           "persistent_state_preflight_projections": metrics.get("persistent_state_preflight_projections"),
+                           "persistent_state_postflight_commits": metrics.get("persistent_state_postflight_commits"),
+                           "persistent_state_graph_rebases": metrics.get("persistent_state_graph_rebases"),
+                           "persistent_state_material_transitions": metrics.get("persistent_state_material_transitions"),
+                           "persistent_state_deliveries": metrics.get("persistent_state_deliveries"),
+                           "wall_time_sec": metrics.get("wall_time_sec")})
+          provider_identity = (
+              "openrouter:deepseek:only:no-fallback"
+              if os.environ.get("PROVIDER") == "openrouter"
+              else "tokenrouter:exact-catalog:openai-compatible"
+              if os.environ.get("PROVIDER") == "tokenrouter"
+              else "deepseek:native:api.deepseek.com"
+              if os.environ.get("PROVIDER") == "deepseek"
+              else "configured"
+          )
+          model_identity = os.environ.get("MODEL") or ""
+          response_models = sorted({
+              model
+              for row in rows
+              for model in ((row.get("provider_response_identity") or {}).get("executor") or {}).get("models", [])
+              if model
+          })
+          response_providers = sorted({
+              provider
+              for row in rows
+              for provider in ((row.get("provider_response_identity") or {}).get("executor") or {}).get("providers", [])
+              if provider
+          })
+          response_fingerprints = sorted({
+              fingerprint
+              for row in rows
+              for fingerprint in ((row.get("provider_response_identity") or {}).get("executor") or {}).get("system_fingerprints", [])
+              if fingerprint
+          })
+          unique_setup_overheads = {
+              json.dumps(item, sort_keys=True, separators=(",", ":"))
+              for item in setup_overheads
+          }
+          setup_overhead = (
+              json.loads(next(iter(unique_setup_overheads)))
+              if len(unique_setup_overheads) == 1
+              else {}
+          )
+          arm = os.environ.get("ARM") or "gt_on"
+          claim_scope = (
+              "control"
+              if arm == "gt_off"
+              else
+              "persistent_state_mechanism_diagnostic"
+              if (os.environ.get("PROFILE") or "") == "persistent_state_only"
+              else "integrated_groundtruth_product"
+          )
+          outcome_counts = {key: 0 for key in ("PASS", "FAIL", "INFRA_TIMEOUT", "INFRA_FAILURE", "UNKNOWN")}
+          for row in rows:
+              outcome_counts[row["outcome_class"]] = outcome_counts.get(row["outcome_class"], 0) + 1
+          # Missing artifacts are infrastructure failures, never silent task drops.
+          outcome_counts["INFRA_FAILURE"] += len(missing)
+          out = {"schema": "gt.deepswe.central.evaluation.v1.1",
+                 "manifest": {"benchmark_sha": os.environ.get("BENCH_SHA"),
+                              "gt_commit": os.environ.get("GT_SHA"),
+                              "model": model_identity,
+                              "provider": provider_identity,
+                              "provider_response_models": response_models,
+                              "provider_response_providers": response_providers,
+                              "provider_system_fingerprints": response_fingerprints,
+                              "temperature": 1.0,
+                              "step_limit": int(os.environ.get("STEP_LIMIT") or 0),
+                              "execution_budget_sec": 5400,
+                              "runner": "datacurve-pier==0.3.1",
+                               "workspace_prompt_contract": "resolved_workspace_v1",
+                               "miniswe_version": "2.2.8",
+                               "executor_retry_policy": "provider_once_no_retry",
+                               "protocol_class": "matched_diagnostic",
+                               "rollouts_per_task": 1,
+                               "leaderboard_equivalent": False,
+                               "arm": arm,
+                               "integration_mode": "off" if arm == "gt_off" else "active",
+                               "claim_scope": claim_scope,
+                               "comparison_profile": os.environ.get("PROFILE") or "",
+                              "diagnostic_only": os.environ.get("DIAGNOSTIC_ONLY") == "1"},
+                  "benchmark_setup_overhead": setup_overhead,
+                 "tasks": expected, "rows": rows, "missing": missing,
+                 "outcome_counts": outcome_counts,
+                 "solved": sum(r["solved"] for r in rows), "planned": len(expected)}
+          integrity_failures = {
+              "delivery": {
+                  r["task"]: list(r["delivery_failures"])
+                  for r in rows if r["delivery_failures"]
+              },
+              "runtime": {
+                  r["task"]: list(r["runtime_gate_failures"])
+                  for r in rows if r["runtime_gate_failures"]
+              },
+              "treatment": {
+                  r["task"]: list(r["treatment_release_failures"])
+                  for r in rows if r["treatment_release_failures"]
+              },
+              "provider_identity": [
+                  r["task"] for r in rows if not r["provider_response_identity_valid"]
+              ],
+              "provider_route": [
+                  r["task"] for r in rows if not r["provider_route_valid"]
+              ],
+          }
+          out["integrity_failures"] = integrity_failures
+          out["benchmark_valid"] = not missing and not any(integrity_failures.values())
+          Path("DEEPSWE_EVALUATION_RESULTS.json").write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+          md = ["# DeepSWE central evaluation", "", f"- solved: **{out['solved']}/{out['planned']}**", f"- outcome counts: **{json.dumps(out['outcome_counts'], sort_keys=True)}**", f"- profile: **{out['manifest']['comparison_profile']}**", f"- diagnostic-only: **{out['manifest']['diagnostic_only']}**", f"- missing artifacts: **{len(missing)}**", "", "| task | outcome | solved | product mechanisms | legacy fired | PES lifecycle uses | deliveries | graph | dense | calls | steps | actions | tokens | bootstrap calls | state frames |", "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"]
+          for r in rows:
+              census = r.get("product_mechanism_census") or {}
+              persistent = census.get("persistent_execution_state") or {}
+              md.append(f"| {r['task']} | {r['outcome_class']} | {int(r['solved'])} | {census.get('configured_mechanism_count', 0)}/18 | {census.get('naturally_fired_legacy_feature_count', 0)}/17 | {persistent.get('lifecycle_use_count', 0)} | {r['provider_delivery_count']} | {r['graph_status']} | {int(r['dense_available'])} | {r['provider_calls']} | {r['assistant_steps']} | {r['effective_actions']} | {r['total_tokens']} | {r['persistent_state_bootstrap_calls']} | {r['persistent_state_context_compilations']} |")
+          Path("DEEPSWE_EVALUATION_RESULTS.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+          print("\n".join(md))
+          gate_errors = []
+          if missing:
+              gate_errors.append("missing task artifacts: " + ", ".join(missing))
+          if any(r["delivery_failures"] for r in rows):
+              gate_errors.append("provider-delivery audit failed")
+          if any(r["runtime_gate_failures"] for r in rows):
+              gate_errors.append("GT runtime integrity gate failed")
+          if any(r["treatment_release_failures"] for r in rows):
+              gate_errors.append("GT treatment release gate failed")
+          if any(not r["provider_route_valid"] for r in rows):
+              gate_errors.append("exact provider route gate failed")
+          if any(not r["provider_response_identity_valid"] for r in rows):
+              gate_errors.append("actual provider response identity gate failed")
+          if (os.environ.get("ARM") or "gt_on") == "gt_on" and any(
+              int((r.get("product_mechanism_census") or {}).get("legacy_feature_count") or 0) != 17
+              or int((r.get("product_mechanism_census") or {}).get("product_mechanism_count") or 0) != 18
+              or int((r.get("product_mechanism_census") or {}).get("configured_mechanism_count") or 0) != 18
+              or (r.get("product_mechanism_census") or {}).get("mechanism_ids", [])[-1:]
+              != ["persistent_execution_state"]
+              or (r.get("product_mechanism_census") or {}).get(
+                  "persistent_execution_state", {}
+              ).get("exercised") is not True
+              for r in rows
+          ):
+              gate_errors.append("17+1 GT product mechanism census failed")
+          if any(r["workspace_prompt_contract"] != "resolved_workspace_v1" for r in rows):
+              gate_errors.append("workspace prompt contract gate failed")
+          if gate_errors:
+              print("INTEGRITY_GATE_FAILURES=" + json.dumps(gate_errors))
+              if os.environ.get("DIAGNOSTIC_ONLY") != "1":
+                  raise SystemExit("; ".join(gate_errors))
+              print("DIAGNOSTIC_OUTCOME_PUBLISHED_WITH_INTEGRITY_FAILURES")
+          PY
+      - name: Enforce outcome-first DeepSWE release gate
+        if: ${{ inputs.arm == 'gt_on' && !inputs.diagnostic_only }}
+        run: |
+          set -euo pipefail
+          python scripts/deepswe_release_gate.py \
+            --baseline DEEPSWE_BASELINE_RESULTS.json \
+            --treatment DEEPSWE_EVALUATION_RESULTS.json \
+            --phase "${{ inputs.release_phase }}" \
+            --output DEEPSWE_RELEASE_GATE.json
+      - name: Publish merged evaluation result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepswe-central-${{ github.run_id }}-merged
+          path: |
+            DEEPSWE_EVALUATION_RESULTS.json
+            DEEPSWE_EVALUATION_RESULTS.md
+            DEEPSWE_BASELINE_RESULTS.json
+            DEEPSWE_RELEASE_GATE.json
+          if-no-files-found: warn
+`n      monitor_timeout_minutes: "330"`n    secrets: inherit
 
   run:
     needs: [plan, baseline, provider_free, bootstrap_canary]
