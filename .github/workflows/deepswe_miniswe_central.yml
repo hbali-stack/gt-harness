@@ -149,7 +149,9 @@ jobs:
       - name: Resolve exact GT revision
         id: gt
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Enforce active release authorization`n        if: ${{ !inputs.diagnostic_only }}`n        run: |
+      - name: Enforce active release authorization
+        if: ${{ !inputs.diagnostic_only }}
+        run: |
           python -m scripts.release_workflow_guard \
             --workflow deepswe_miniswe_central.yml \
             --runtime-sha "$(git rev-parse HEAD)"
@@ -438,7 +440,8 @@ jobs:
                   model = f"openai/{model}"
               export("GT_LITELLM_MODEL", model)
               export("OPENAI_BASE_URL", os.environ["PROVIDER_BASE_URL"])
-              provider_only = "minimax" if "minimax" in model.lower() else ""`n              export("GT_OPENROUTER_PROVIDER_ONLY", provider_only)
+              provider_only = "minimax" if "minimax" in model.lower() else ""
+              export("GT_OPENROUTER_PROVIDER_ONLY", provider_only)
               export("GT_OPENROUTER_DATA_COLLECTION", "allow")
           elif provider == "tokenrouter":
               if not model.startswith("openai/"):
@@ -1304,7 +1307,9 @@ jobs:
             DEEPSWE_BASELINE_RESULTS.json
             DEEPSWE_RELEASE_GATE.json
           if-no-files-found: warn
-`n      monitor_timeout_minutes: "330"`n    secrets: inherit
+
+      monitor_timeout_minutes: "330"
+    secrets: inherit
 
   run:
     needs: [plan, baseline, provider_free, bootstrap_canary]
