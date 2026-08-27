@@ -724,11 +724,15 @@ jobs:
           set -uo pipefail
           mkdir -p results/deepswe
           TREATMENT_CONTRACT="$RUNNER_TEMP/gt-treatment-runtime.json"
-          python -m scripts.render_treatment_agent_args \
-            --release-manifest eval/release/active_release.json \
-            --source-sha "$(git rev-parse HEAD)" \
-            --max-steps "$STEP_LIMIT" \
-            --output "$TREATMENT_CONTRACT"
+          TREATMENT_ARGS=()
+          if [ "$PROFILE" != "baseline" ]; then
+            python -m scripts.render_treatment_agent_args \
+              --release-manifest eval/release/active_release.json \
+              --source-sha "$(git rev-parse HEAD)" \
+              --max-steps "$STEP_LIMIT" \
+              --output "$TREATMENT_CONTRACT"
+            TREATMENT_ARGS=(--ak treatment_runtime_contract_path="$TREATMENT_CONTRACT")
+          fi
           if [ "$PROFILE" = "persistent_state_only" ]; then
             python -c 'import hashlib,json,pathlib,sys; p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text()); d["agent_kwargs"].update({"dense_fallback_only":False,"enable_adaptive_validation_timeout":False,"enable_completion_controller":False,"enable_context_compaction":False,"enable_progress_control":False,"enable_shadow_submit_gate":False,"preflight_mode":"shadow","gt_task_evidence_budget_tokens":1200,"gt_task_critical_reserve_tokens":512,"enable_replay_capture":True}); m=dict(d); m.pop("contract_sha256",None); d["contract_sha256"]=hashlib.sha256(json.dumps(m,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8","surrogatepass")).hexdigest(); p.write_text(json.dumps(d,indent=2,sort_keys=True)+"\n")' "$TREATMENT_CONTRACT"
           fi
@@ -820,7 +824,7 @@ jobs:
               --agent-timeout-multiplier 1.0 -n 1 -y \
               "${PROFILE_ARGS[@]}" \
               --ak enable_replay_capture=true \
-              --ak treatment_runtime_contract_path="$TREATMENT_CONTRACT" \
+              "${TREATMENT_ARGS[@]}" \
               --ak preemptive_retrieval_model_dir="$MODEL_DIR" \
               --ak enable_task_start_advisory=false \
               --ak step_limit="$STEP_LIMIT" \
