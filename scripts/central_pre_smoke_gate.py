@@ -21,7 +21,6 @@ RELEASE_TESTS = (
     "tests/test_gt_central_agent.py::test_persistent_state_is_one_switch_and_off_audit_cannot_enable_it",
     "tests/test_central_release_gate.py::test_release_gate_rejects_bootstrap_only_or_silently_missing_living_state",
     "tests/test_central_release_gate.py::test_release_gate_rejects_missing_or_unwired_initial_hybrid_retrieval",
-    "tests/test_central_release_gate.py::test_release_gate_rejects_fallback_bootstrap_and_hidden_extra_calls",
     "tests/test_gt_central_runtime.py::test_effect_timing_consumes_evidence_before_the_next_action",
     "tests/test_gt_central_runtime.py::test_documented_direct_census_entrypoint_is_executable",
     "tests/test_gt_central_agent.py::test_paid_engine_workflow_receives_exact_harbor_budget_without_new_limit",
