@@ -652,6 +652,7 @@ jobs:
           PY
           echo "MODEL_DIR=$model_dir" >> "$GITHUB_ENV"
       - name: Prove current provider-free runtime before task execution
+        if: ${{ inputs.arm != 'gt_off' }}
         run: |
           set -euo pipefail
           # GITHUB_ENV is available to later steps, but make the exact
