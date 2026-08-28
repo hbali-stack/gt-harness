@@ -864,6 +864,59 @@ jobs:
             fi
           fi
           exit "$status"
+      - name: Publish task outcome visibility
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          task = os.environ.get("TASK", "")
+          model = os.environ.get("MODEL", "")
+          provider = os.environ.get("PROVIDER", "")
+          candidates = sorted(Path("results/deepswe").rglob("result.json"))
+          result = None
+          for path in candidates:
+              try:
+                  item = json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  continue
+              if isinstance(item, dict) and ("verifier_result" in item or "exception_info" in item):
+                  result = item
+                  break
+          result = result or {}
+          verifier = result.get("verifier_result") or {}
+          rewards = verifier.get("rewards") or {}
+          exception = result.get("exception_info")
+          reward = rewards.get("reward")
+          if reward == 1 and not exception:
+              outcome = "PASS"
+          elif reward == 0 and not exception:
+              outcome = "FAIL"
+          else:
+              text = json.dumps(exception, ensure_ascii=False).lower() if exception else ""
+              outcome = "INFRA_TIMEOUT" if any(x in text for x in ("timeout", "timed out", "deadline", "execution_budget")) else "INFRA_FAILURE" if exception else "UNKNOWN"
+          payload = {
+              "task": task,
+              "model": model,
+              "provider": provider,
+              "outcome_class": outcome,
+              "solved": outcome == "PASS",
+              "reward": reward,
+              "exception_type": (exception or {}).get("exception_type") if isinstance(exception, dict) else None,
+              "exception_message": (exception or {}).get("exception_message") if isinstance(exception, dict) else None,
+              "result_files_found": len(candidates),
+          }
+          Path("task-outcome.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+          summary = Path(os.environ.get("GITHUB_STEP_SUMMARY", "task-outcome.md"))
+          with summary.open("a", encoding="utf-8") as out:
+              out.write(f"## DeepSWE task outcome: `{task}`\n\n")
+              out.write(f"- **Outcome:** `{outcome}`\n- **Solved:** `{payload['solved']}`\n- **Reward:** `{reward}`\n- **Model:** `{model}`\n- **Provider:** `{provider}`\n")
+              if payload["exception_type"]:
+                  out.write(f"- **Exception:** `{payload['exception_type']}` — {payload['exception_message']}\n")
+          print(json.dumps(payload, sort_keys=True))
+          PY
       - name: Upload task evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -877,6 +930,7 @@ jobs:
             provider-route-proof.json
             deepswe-budget-${{ matrix.task }}.json
             deepswe-task.log
+            task-outcome.json
           if-no-files-found: warn
 
   # Publish task outcomes independently from the strict GT receipt merge gate.
