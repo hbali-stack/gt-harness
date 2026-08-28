@@ -2352,6 +2352,15 @@ class MiniSweCentralAgent(BaseAgent):
             if openrouter:
                 if not model.startswith("openai/"):
                     model = f"openai/{model}"
+                # Inkling's free endpoint is restricted to agentic harnesses.
+                # Identify this request as an honest headless coding agent and
+                # make the tool-driven loop explicit at the OpenRouter boundary.
+                kwargs["extra_headers"] = {
+                    "HTTP-Referer": "https://github.com/hbali-stack/gt-harness",
+                    "X-OpenRouter-Title": "DeepSWE Mini-SWE Agent",
+                    "X-OpenRouter-Categories": "cli-agent,cloud-agent",
+                }
+                kwargs["tool_choice"] = "auto"
                 provider = (os.environ.get("GT_OPENROUTER_PROVIDER_ONLY") or "").strip()
                 if provider:
                     provider_policy = {
