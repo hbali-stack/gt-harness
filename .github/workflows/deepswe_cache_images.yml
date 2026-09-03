@@ -1,0 +1,160 @@
+name: "DeepSWE: Mirror task images to GHCR"
+
+# One-time mirror. The 113 DeepSWE tasks each pin an AWS ECR Public image
+# (public.ecr.aws/d3j8x8q7/swe-bench-202605:<hash>-v1.1) in their task.toml.
+# There is no cache today, so every run re-pulls all 113 from ECR. Mirroring
+# them into GHCR once makes every later run a same-network GHCR pull.
+#
+# Uses pier's task definitions only. harbor is the TB2 runner and is not
+# installed here; no runner package is needed to read task.toml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deepswe_ref:
+        description: "Pinned datacurve-ai/deep-swe commit supplying the task set"
+        type: string
+        required: true
+        default: "435ee89ec2f2e2289f33b0da4f992f0b7b7266b9"
+      batch_size:
+        description: "Images per job"
+        type: string
+        required: true
+        default: "8"
+      max_parallel:
+        description: "Max concurrent mirror jobs"
+        type: string
+        required: true
+        default: "5"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - name: Checkout pinned DeepSWE task set
+        uses: actions/checkout@v4
+        with:
+          repository: datacurve-ai/deep-swe
+          ref: ${{ inputs.deepswe_ref }}
+          path: deepswe-bench
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: build
+        name: Read docker_image from every task.toml and batch them
+        env:
+          BATCH_SIZE: ${{ inputs.batch_size }}
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys, tomllib
+          from pathlib import Path
+
+          images = set()
+          for toml_path in sorted(Path("deepswe-bench/tasks").glob("*/task.toml")):
+              with toml_path.open("rb") as handle:
+                  data = tomllib.load(handle)
+              found = None
+              stack = [data]
+              while stack:
+                  node = stack.pop()
+                  if isinstance(node, dict):
+                      if isinstance(node.get("docker_image"), str):
+                          found = node["docker_image"]
+                          break
+                      stack.extend(node.values())
+              if found:
+                  images.add(found)
+
+          if not images:
+              raise SystemExit("::error::no docker_image entries found in task.toml files")
+
+          ordered = sorted(images)
+          size = max(1, int(os.environ["BATCH_SIZE"]))
+          batches = [ordered[i : i + size] for i in range(0, len(ordered), size)]
+          include = [
+              {"batch_id": i, "images": ",".join(b)} for i, b in enumerate(batches)
+          ]
+          print("matrix=" + json.dumps({"include": include}))
+          print(f"::notice::mirroring {len(ordered)} DeepSWE images in {len(batches)} batches", file=sys.stderr)
+          PY
+
+  mirror:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror ECR Public -> GHCR
+        # ECR Public serves anonymous pulls, so no AWS credentials are needed
+        # for a one-time mirror.
+        env:
+          IMAGES: ${{ matrix.images }}
+          GHCR_PREFIX: ghcr.io/${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          IFS=',' read -ra IMAGE_ARRAY <<< "$IMAGES"
+          TOTAL=${#IMAGE_ARRAY[@]}; COUNT=0; CACHED=0; FAILED=0
+
+          with_retry() {
+            local ACTION="$1" IMAGE="$2" DELAY=10
+            for i in 1 2 3; do
+              if docker "$ACTION" "$IMAGE" >/dev/null 2>&1; then return 0; fi
+              [ "$i" -lt 3 ] && { echo "    $ACTION retry $i/3 in ${DELAY}s..."; sleep "$DELAY"; DELAY=$((DELAY * 2)); }
+            done
+            return 1
+          }
+
+          for SRC in "${IMAGE_ARRAY[@]}"; do
+            COUNT=$((COUNT + 1))
+            # public.ecr.aws/d3j8x8q7/swe-bench-202605:<tag> -> <repo>:<tag>
+            REPO_AND_TAG="${SRC##*/}"
+            DST="${GHCR_PREFIX}/${REPO_AND_TAG}"
+            echo "=== [$COUNT/$TOTAL] $REPO_AND_TAG ==="
+
+            if docker manifest inspect "$DST" >/dev/null 2>&1; then
+              echo "  already in GHCR, skipping"; CACHED=$((CACHED + 1)); continue
+            fi
+            if ! with_retry pull "$SRC"; then
+              echo "::warning::pull failed: $SRC"; FAILED=$((FAILED + 1)); continue
+            fi
+            docker tag "$SRC" "$DST"
+            if with_retry push "$DST"; then
+              echo "  mirrored -> $DST"
+            else
+              echo "::warning::push failed: $DST"; FAILED=$((FAILED + 1))
+            fi
+            docker rmi "$SRC" "$DST" >/dev/null 2>&1 || true
+          done
+
+          echo "=== batch ${{ matrix.batch_id }}: total=$TOTAL already=$CACHED failed=$FAILED new=$((TOTAL - CACHED - FAILED)) ==="
+          {
+            echo "## DeepSWE batch ${{ matrix.batch_id }}"
+            echo "total=$TOTAL already=$CACHED failed=$FAILED new=$((TOTAL - CACHED - FAILED))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" -eq "$TOTAL" ]; then
+            echo "::error::every image in this batch failed"; exit 1
+          fi

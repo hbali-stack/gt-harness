@@ -1,0 +1,154 @@
+name: "TB2: Mirror task images to GHCR"
+
+# One-time mirror. TB2 task images live on Docker Hub as alexgshaw/<task>:<tag>
+# and were cached as gzipped tarballs in the GitHub Actions cache, which is hard
+# capped at 10 GB per repository. terminal-bench@2.0 has 89 tasks at roughly
+# 450 MB compressed each (~40 GB), so that cache can never hold more than ~20 --
+# the rest re-pull from Docker Hub on every run. GHCR has no such ceiling, so we
+# mirror once here and pull from GHCR thereafter.
+#
+# Uses harbor only. pier is the DeepSWE runner and is deliberately not installed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Task image tag (alexgshaw/<task>:<tag>); must match the eval workflow"
+        type: string
+        required: true
+        default: "20251031"
+      batch_size:
+        description: "Images per job"
+        type: string
+        required: true
+        default: "8"
+      max_parallel:
+        description: "Max concurrent mirror jobs"
+        type: string
+        required: true
+        default: "5"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install harbor (TB2 runner)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "harbor==0.20.0"
+
+      - id: build
+        name: Enumerate terminal-bench@2.0 tasks and batch them
+        env:
+          DATASET: terminal-bench@2.0
+          BATCH_SIZE: ${{ inputs.batch_size }}
+        run: |
+          set -euo pipefail
+          harbor dataset download "$DATASET" -o ds --export
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          from pathlib import Path
+
+          root = Path("ds") / os.environ["DATASET"].split("@", 1)[0]
+          tasks = sorted(p.name for p in root.iterdir() if p.is_dir())
+          if not tasks:
+              raise SystemExit("::error::no tasks found under " + str(root))
+          size = max(1, int(os.environ["BATCH_SIZE"]))
+          batches = [tasks[i : i + size] for i in range(0, len(tasks), size)]
+          include = [
+              {"batch_id": i, "tasks": ",".join(b)} for i, b in enumerate(batches)
+          ]
+          print("matrix=" + json.dumps({"include": include}))
+          print(f"::notice::mirroring {len(tasks)} TB2 tasks in {len(batches)} batches", file=sys.stderr)
+          PY
+
+  mirror:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel) }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        # Anonymous pulls share a 100/hr quota tied to the runner egress IP,
+        # which GitHub-hosted runners share across tenants. Authenticating
+        # lifts this job to 200/hr on its own account.
+        uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME_ROTATION }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKERHUB_TOKEN_ROTATION }}
+
+      - name: Mirror Docker Hub -> GHCR
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          TASKS: ${{ matrix.tasks }}
+          GHCR_PREFIX: ghcr.io/${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          IFS=',' read -ra TASK_ARRAY <<< "$TASKS"
+          TOTAL=${#TASK_ARRAY[@]}; COUNT=0; CACHED=0; FAILED=0
+
+          with_retry() {
+            local ACTION="$1" IMAGE="$2" DELAY=10
+            for i in 1 2 3; do
+              if docker "$ACTION" "$IMAGE" >/dev/null 2>&1; then return 0; fi
+              [ "$i" -lt 3 ] && { echo "    $ACTION retry $i/3 in ${DELAY}s..."; sleep "$DELAY"; DELAY=$((DELAY * 2)); }
+            done
+            return 1
+          }
+
+          for TASK in "${TASK_ARRAY[@]}"; do
+            COUNT=$((COUNT + 1))
+            SRC="docker.io/alexgshaw/${TASK}:${IMAGE_TAG}"
+            DST="${GHCR_PREFIX}/tb2.${TASK}:${IMAGE_TAG}"
+            echo "=== [$COUNT/$TOTAL] $TASK ==="
+
+            if docker manifest inspect "$DST" >/dev/null 2>&1; then
+              echo "  already in GHCR, skipping"; CACHED=$((CACHED + 1)); continue
+            fi
+            if ! with_retry pull "$SRC"; then
+              echo "::warning::pull failed: $SRC"; FAILED=$((FAILED + 1)); continue
+            fi
+            docker tag "$SRC" "$DST"
+            if with_retry push "$DST"; then
+              echo "  mirrored -> $DST"
+            else
+              echo "::warning::push failed: $DST"; FAILED=$((FAILED + 1))
+            fi
+            docker rmi "$SRC" "$DST" >/dev/null 2>&1 || true
+          done
+
+          echo "=== batch ${{ matrix.batch_id }}: total=$TOTAL already=$CACHED failed=$FAILED new=$((TOTAL - CACHED - FAILED)) ==="
+          {
+            echo "## TB2 batch ${{ matrix.batch_id }}"
+            echo "total=$TOTAL already=$CACHED failed=$FAILED new=$((TOTAL - CACHED - FAILED))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" -eq "$TOTAL" ]; then
+            echo "::error::every image in this batch failed"; exit 1
+          fi
