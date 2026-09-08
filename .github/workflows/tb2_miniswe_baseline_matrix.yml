@@ -14,22 +14,14 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "Model id for harbor -m, passed through verbatim when base_url is set (api.deepseek.com wants bare 'deepseek-v4-flash')"
+        description: "OpenRouter model id. No default: use the same exact model as the GT-on arm."
         type: string
-        default: "deepseek-v4-flash"
-      provider_secret:
-        description: "Repository Actions secret name containing the provider key"
-        type: string
-        default: "OPENROUTER_NEW"
-      api_key:
-        description: "Provider API key supplied at dispatch time; falls back to the repository secret when omitted."
-        type: string
-        required: false
-        default: ""
+        required: true
       base_url:
-        description: "OpenAI-compatible gateway URL; exported as OPENAI_BASE_URL (overrides the repo secret)"
+        description: "OpenRouter OpenAI-compatible API URL"
         type: string
-        default: ""
+        required: true
+        default: "https://openrouter.ai/api/v1"
       parallel:
         description: "Max concurrent task jobs (GHA concurrency cap)"
         type: string
@@ -58,9 +50,9 @@ jobs:
     outputs:
       tasks: ${{ steps.enum.outputs.tasks }}
     env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets[inputs.provider_secret] || inputs.api_key || secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ inputs.base_url != '' && inputs.base_url || secrets.OPENAI_BASE_URL }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_BASE_URL: ${{ inputs.base_url }}
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +71,7 @@ jobs:
           import os, sys
 
           cleaned, notes = [], []
-          for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+          for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
               raw = os.environ.get(name) or ""
               if not raw:
                   continue
@@ -193,9 +185,9 @@ jobs:
       matrix:
         task: ${{ fromJson(needs.plan.outputs.tasks) }}
     env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets[inputs.provider_secret] || inputs.api_key || secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ inputs.base_url != '' && inputs.base_url || secrets.OPENAI_BASE_URL }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_BASE_URL: ${{ inputs.base_url }}
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
@@ -220,7 +212,7 @@ jobs:
           import os, sys
 
           cleaned = []
-          for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+          for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
               raw = os.environ.get(name) or ""
               if not raw:
                   continue

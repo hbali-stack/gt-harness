@@ -15,22 +15,24 @@ name: TB2 miniswe central matrix (GT-on)
 on:
   workflow_dispatch:
     inputs:
-      api_key:
-        description: "Provider API key, supplied from outside at dispatch time (overrides the repo secret)."
-        required: false
-        default: ""
       model:
-        description: "Model id for harbor -m; native DeepSeek requires deepseek-v4-flash"
+        description: "OpenRouter model id. No default: choose the exact model when dispatching."
         type: string
-        default: "openrouter/stealth/ox-alpha"
+        required: true
       provider:
-        description: "OpenAI-compatible provider route"
+        description: "Frozen provider route"
         type: choice
-        options: [configured, deepseek]
-        default: deepseek
+        options: [openrouter]
+        default: openrouter
       base_url:
-        description: "OpenAI-compatible gateway URL; exported as OPENAI_BASE_URL (overrides the repo secret)"
+        description: "OpenRouter OpenAI-compatible API URL"
         type: string
+        required: true
+        default: "https://openrouter.ai/api/v1"
+      openrouter_provider:
+        description: "Optional exact OpenRouter provider slug; observed routing remains receipt-visible."
+        type: string
+        required: false
         default: ""
       parallel:
         description: "Max concurrent task jobs (GHA concurrency cap)"
@@ -55,7 +57,7 @@ on:
       ref:
         description: "Repository ref to check out (the ENGINE code lives on the inline-engine branch)"
         type: string
-        default: "inline-engine"
+        default: "main"
       arm:
         description: "Conservative component arm; paid execution still requires the pre-smoke gate"
         type: choice
@@ -110,11 +112,11 @@ jobs:
     outputs:
       tasks: ${{ steps.enum.outputs.tasks }}
     env:
-      ANTHROPIC_API_KEY: ${{ inputs.api_key || secrets.ANTHROPIC_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ inputs.api_key || secrets.DEEPSEEK_API_KEY }}
-      OPENAI_API_KEY: ${{ inputs.provider == 'deepseek' && secrets.DEEPSEEK_API_KEY || secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ inputs.provider == 'deepseek' && 'https://api.deepseek.com' || (inputs.base_url != '' && inputs.base_url || secrets.OPENAI_BASE_URL) }}
-      GT_LITELLM_MODEL: openai/deepseek-v4-flash
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_BASE_URL: ${{ inputs.base_url }}
+      GT_LITELLM_MODEL: ${{ inputs.model }}
+      GT_OPENROUTER_PROVIDER_ONLY: ${{ inputs.openrouter_provider }}
       PYTHONUTF8: "1"
       GH_TOKEN: ${{ github.token }}
       GT_INDEX_BINARY: ${{ github.workspace }}/vendor/gt-index-linux-amd64
@@ -177,7 +179,7 @@ jobs:
           import os, sys
 
           cleaned, notes = [], []
-          for name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"):
+          for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
               raw = os.environ.get(name) or ""
               if not raw:
                   continue
@@ -271,11 +273,11 @@ jobs:
       matrix:
         task: ${{ fromJson(needs.plan.outputs.tasks) }}
     env:
-      ANTHROPIC_API_KEY: ${{ inputs.api_key || secrets.ANTHROPIC_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ inputs.api_key || secrets.DEEPSEEK_API_KEY }}
-      OPENAI_API_KEY: ${{ inputs.provider == 'deepseek' && secrets.DEEPSEEK_API_KEY || secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ inputs.provider == 'deepseek' && 'https://api.deepseek.com' || (inputs.base_url != '' && inputs.base_url || secrets.OPENAI_BASE_URL) }}
-      GT_LITELLM_MODEL: openai/deepseek-v4-flash
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENROUTER_NEW || secrets.OPENROUTER_API_KEY }}
+      OPENAI_BASE_URL: ${{ inputs.base_url }}
+      GT_LITELLM_MODEL: ${{ inputs.model }}
+      GT_OPENROUTER_PROVIDER_ONLY: ${{ inputs.openrouter_provider }}
       PYTHONUTF8: "1"
       GT_INDEX_BINARY: ${{ github.workspace }}/vendor/gt-index-linux-amd64
       SNOWFLAKE_MODEL_REVISION: 7802add0519e4bf94c46ef23552176697c7a1ac7
@@ -399,7 +401,7 @@ jobs:
           import os, sys
 
           cleaned = []
-          for name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"):
+          for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
               raw = os.environ.get(name) or ""
               if not raw:
                   continue
