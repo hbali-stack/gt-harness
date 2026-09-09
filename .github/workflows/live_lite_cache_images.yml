@@ -161,9 +161,8 @@ jobs:
           echo "=== Batch ${{ matrix.batch_id }} Summary ==="
           echo "Total: $TOTAL | Already cached: $CACHED | Failed: $FAILED | New: $((TOTAL - CACHED - FAILED))"
 
-          # Fail the job only if ALL images failed (partial success is OK)
-          if [ "$FAILED" -eq "$TOTAL" ]; then
-            echo "::error::All images in batch failed"
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::$FAILED of $TOTAL images failed"
             exit 1
           fi
 

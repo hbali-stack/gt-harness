@@ -149,6 +149,6 @@ jobs:
             echo "total=$TOTAL already=$CACHED failed=$FAILED new=$((TOTAL - CACHED - FAILED))"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$FAILED" -eq "$TOTAL" ]; then
-            echo "::error::every image in this batch failed"; exit 1
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::$FAILED of $TOTAL images failed"; exit 1
           fi
