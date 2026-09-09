@@ -114,8 +114,17 @@ jobs:
             )
             all_jobs_done=false
             if (( observed_jobs > 0 && completed_jobs == observed_jobs )); then all_jobs_done=true; fi
-            render_snapshot "$all_jobs_done"
-            if [[ "$all_jobs_done" == true ]]; then finalized=true; break; fi
+            echo "RUNNER_PROGRESS task_jobs=${observed_jobs} task_jobs_completed=${completed_jobs}"
+            if [[ "$all_jobs_done" == true ]]; then
+              # Artifact indexing can trail job completion briefly. Refresh once
+              # after a grace period before classifying missing receipts as infra.
+              sleep 10
+              refresh_artifacts || echo "::warning::Final progress artifact refresh failed"
+              render_snapshot true
+              finalized=true
+              break
+            fi
+            render_snapshot false
             sleep "${POLL_SECONDS:-30}"
           done
 
