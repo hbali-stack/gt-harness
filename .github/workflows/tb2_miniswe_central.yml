@@ -597,6 +597,24 @@ jobs:
           sudo find results -type f -exec chmod a+r {} + 2>/dev/null || \
             sudo chmod -R a+r results || true
 
+      - name: Create official-verifier progress receipt
+        if: always()
+        env:
+          TASK: ${{ matrix.task }}
+        run: |
+          python -m scripts.benchmark_progress emit-harbor \
+            --root results/terminal-bench \
+            --task-id "$TASK" \
+            --output benchmark-progress.json
+
+      - name: Upload official-verifier progress receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-progress-tb2-${{ github.run_id }}-${{ matrix.task }}
+          path: benchmark-progress.json
+          if-no-files-found: error
+
       - name: Disk after run
         if: always()
         run: df -h /
