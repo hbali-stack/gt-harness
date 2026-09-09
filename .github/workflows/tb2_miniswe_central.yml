@@ -84,6 +84,7 @@ on:
 permissions:
   contents: read
   actions: read
+  packages: read
 
 jobs:
   resolve:
@@ -429,6 +430,27 @@ jobs:
           docker load -i "${{ runner.temp }}/tb2-img.tar.gz"
           echo "loaded task image from cache for ${{ matrix.task }}"
 
+      - name: Pull task image before agent execution on cache miss
+        if: steps.restore.outputs.cache-hit != 'true'
+        env:
+          TASK: ${{ matrix.task }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          mirror="ghcr.io/${{ github.repository_owner }}/tb2.${TASK}:${IMAGE_TAG}"
+          canonical="alexgshaw/${TASK}:${IMAGE_TAG}"
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          docker pull "$mirror"
+          docker tag "$mirror" "$canonical"
+          docker image inspect "$canonical" >/dev/null
+
+      - name: Require the task image before Harbor starts
+        env:
+          TASK: ${{ matrix.task }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: docker image inspect "alexgshaw/${TASK}:${IMAGE_TAG}" >/dev/null
+
       - name: Resolve Harbor's exact task-owned agent budget
         env:
           DATASET: ${{ inputs.dataset }}
@@ -596,6 +618,24 @@ jobs:
           # Some task verifiers still return root-owned result artifacts.
           sudo find results -type f -exec chmod a+r {} + 2>/dev/null || \
             sudo chmod -R a+r results || true
+
+      - name: Create official-verifier progress receipt
+        if: always()
+        env:
+          TASK: ${{ matrix.task }}
+        run: |
+          python -m scripts.benchmark_progress emit-harbor \
+            --root results/terminal-bench \
+            --task-id "$TASK" \
+            --output benchmark-progress.json
+
+      - name: Upload official-verifier progress receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-progress-tb2-${{ github.run_id }}-${{ matrix.task }}
+          path: benchmark-progress.json
+          if-no-files-found: error
 
       - name: Disk after run
         if: always()

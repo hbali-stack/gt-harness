@@ -1,39 +1,30 @@
-name: Task progress monitor
+name: Official verifier task progress
 
 on:
   workflow_call:
     inputs:
-      expected_total:
-        description: "Expected number of task jobs"
-        required: false
-        type: string
-        default: ""
       expected_tasks_json:
         description: "JSON task list or matrix include object"
-        required: false
-        type: string
-        default: ""
-      task_job_regex:
-        description: "Regex matching only the task matrix job names"
         required: true
         type: string
-      gate_job_regex:
-        description: "Regex matching the planning job"
+      task_job_regex:
+        description: "Regex matching only benchmark task jobs"
+        required: true
+        type: string
+      artifact_regex:
+        description: "Regex matching progress receipt artifacts"
         required: false
         type: string
-        default: "^(prepare|plan)$"
+        default: '^benchmark-progress-'
       poll_seconds:
-        description: "Seconds between progress snapshots"
         required: false
         type: string
         default: "30"
       monitor_timeout_minutes:
-        description: "Monitor lifetime, matching the benchmark job backstop"
         required: false
         type: string
         default: "350"
       checkpoint_every:
-        description: "Emit a durable progress checkpoint after this many completed tasks"
         required: false
         type: string
         default: "20"
@@ -44,126 +35,118 @@ permissions:
 
 jobs:
   monitor:
-    name: Task progress
+    name: Official verifier progress
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(inputs.monitor_timeout_minutes) }}
     steps:
-      - name: Publish live task progress
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Publish live official-verifier progress
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-          EXPECTED_TOTAL: ${{ inputs.expected_total }}
           EXPECTED_TASKS_JSON: ${{ inputs.expected_tasks_json }}
           TASK_JOB_REGEX: ${{ inputs.task_job_regex }}
-          GATE_JOB_REGEX: ${{ inputs.gate_job_regex }}
+          ARTIFACT_REGEX: ${{ inputs.artifact_regex }}
           POLL_SECONDS: ${{ inputs.poll_seconds }}
           CHECKPOINT_EVERY: ${{ inputs.checkpoint_every }}
           MONITOR_TIMEOUT_MINUTES: ${{ inputs.monitor_timeout_minutes }}
         run: |
           set -euo pipefail
-
-          api_headers=(
-            -H "Accept: application/vnd.github+json"
-            -H "Authorization: Bearer ${GH_TOKEN}"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-          )
-
-          expected="${EXPECTED_TOTAL:-}"
-          if [[ -z "$expected" && -n "${EXPECTED_TASKS_JSON:-}" ]]; then
-            expected="$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); print(len(value if isinstance(value,list) else value.get("include", [])))' "$EXPECTED_TASKS_JSON")"
-          fi
-          [[ "$expected" =~ ^[0-9]+$ ]] || expected=0
-
-          final_stats="0 0 0 0 0 0 0 0"
-          checkpoints_file="$RUNNER_TEMP/task_progress_checkpoints.jsonl"
-          : > "$checkpoints_file"
+          receipts="$RUNNER_TEMP/benchmark-progress-receipts"
+          snapshot="$RUNNER_TEMP/benchmark-progress-snapshot.json"
+          checkpoints="$RUNNER_TEMP/benchmark-progress-checkpoints.jsonl"
+          mkdir -p "$receipts"
+          : > "$checkpoints"
           checkpoint_every="${CHECKPOINT_EVERY:-20}"
           [[ "$checkpoint_every" =~ ^[1-9][0-9]*$ ]] || checkpoint_every=20
           next_checkpoint="$checkpoint_every"
           monitor_minutes="${MONITOR_TIMEOUT_MINUTES:-350}"
           [[ "$monitor_minutes" =~ ^[1-9][0-9]*$ ]] || monitor_minutes=350
           deadline=$(( $(date +%s) + monitor_minutes * 60 ))
-          while (( $(date +%s) < deadline )); do
-            jobs_url="https://api.github.com/repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100"
-            if ! jobs_json="$(curl --fail --silent --show-error --retry 3 "${api_headers[@]}" "$jobs_url")"; then
-              echo "::warning::TASK_PROGRESS_QUERY_FAILED run=${RUN_ID}"
-              sleep "$POLL_SECONDS"
-              continue
-            fi
+          finalized=false
 
-            stats="$(jq -r --arg regex "$TASK_JOB_REGEX" '
-              [.jobs[] | select(.name | test($regex))] as $tasks |
-              [
-                ($tasks | length),
-                ($tasks | map(select(.status == "completed")) | length),
-                ($tasks | map(select(.conclusion == "success")) | length),
-                ($tasks | map(select(.conclusion == "failure")) | length),
-                ($tasks | map(select(.conclusion == "timed_out")) | length),
-                ($tasks | map(select(.conclusion == "cancelled")) | length),
-                ($tasks | map(select(.status == "in_progress")) | length),
-                ($tasks | map(select(.status == "queued")) | length)
-              ] | @tsv' <<< "$jobs_json")"
-            read -r observed completed success failed infra_timeout cancelled in_progress queued <<< "$stats"
-            final_stats="$observed $completed $success $failed $infra_timeout $cancelled $in_progress $queued"
-            total="$expected"
-            if (( total == 0 )); then total="$observed"; fi
+          refresh_artifacts() {
+            gh api --paginate "repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | [.id, .name] | @tsv' \
+              | while IFS=$'\t' read -r artifact_id artifact_name; do
+                  [[ "$artifact_name" =~ $ARTIFACT_REGEX ]] || continue
+                  target="$receipts/$artifact_id"
+                  if [[ ! -f "$target/.downloaded" ]]; then
+                    mkdir -p "$target"
+                    gh api "repos/${REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$target/artifact.zip"
+                    unzip -oq "$target/artifact.zip" -d "$target"
+                    rm -f "$target/artifact.zip"
+                    touch "$target/.downloaded"
+                  fi
+                done
+          }
+
+          render_snapshot() {
+            local finalize_flag="$1"
+            args=(--root "$receipts" --expected-tasks-json "$EXPECTED_TASKS_JSON" --output "$snapshot")
+            [[ "$finalize_flag" == true ]] && args+=(--finalize-missing)
+            python -m scripts.benchmark_progress aggregate "${args[@]}"
+            read -r total completed graded passed verifier_failed infra remaining < <(
+              jq -r '[.total,.completed,.officially_graded,.passed,.verifier_failed,.infrastructure_failed,.remaining] | @tsv' "$snapshot"
+            )
+            echo "OFFICIAL_PROGRESS total=${total} completed=${completed} passed=${passed} reward_0=${verifier_failed} infra_failed=${infra} officially_graded=${graded} tasks_left=${remaining}"
             while (( completed >= next_checkpoint )); do
-              jq -cn --argjson checkpoint "$next_checkpoint" --argjson total "$total" \
-                --argjson completed "$completed" --argjson success "$success" \
-                --argjson failed "$failed" --argjson infra_timeout "$infra_timeout" \
-                --argjson cancelled "$cancelled" --argjson in_progress "$in_progress" \
-                --argjson queued "$queued" \
-                '{checkpoint, total, completed, success, failed, infra_timeout, cancelled, in_progress, queued}' \
-                >> "$checkpoints_file"
-              echo "TASK_PROGRESS_CHECKPOINT checkpoint=${next_checkpoint} total=${total} completed=${completed} success=${success} failed=${failed} infra_timeout=${infra_timeout} cancelled=${cancelled} in_progress=${in_progress} queued=${queued}"
+              jq -c --argjson checkpoint "$next_checkpoint" '. + {checkpoint: $checkpoint}' "$snapshot" >> "$checkpoints"
+              echo "::notice title=Benchmark checkpoint::${completed}/${total} completed | ${passed} passed | ${verifier_failed} reward 0 | ${infra} infra failed | ${remaining} left"
               next_checkpoint=$(( next_checkpoint + checkpoint_every ))
             done
+          }
 
-            remaining=$(( total - completed )); (( remaining < 0 )) && remaining=0
-            echo "TASK_PROGRESS total=${total} completed=${completed} success=${success} failed=${failed} infra_timeout=${infra_timeout} cancelled=${cancelled} in_progress=${in_progress} queued=${queued} remaining=${remaining}"
-
-            if (( total > 0 && completed >= total )); then break; fi
-
-            if (( expected == 0 )); then
-              gate_done="$(jq -r --arg regex "$GATE_JOB_REGEX" '[.jobs[] | select(.name | test($regex)) | select(.status == "completed")] | length' <<< "$jobs_json")"
-              if (( gate_done > 0 )); then
-                echo "::warning::TASK_PROGRESS_NO_MATRIX gate job completed before a task matrix was created"
-                break
-              fi
+          while (( $(date +%s) < deadline )); do
+            refresh_artifacts || echo "::warning::Could not refresh progress artifacts; retrying"
+            jobs_json="$(gh api --paginate "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" | jq -s '{jobs: map(.jobs[]) }')"
+            read -r observed_jobs completed_jobs < <(
+              jq -r --arg regex "$TASK_JOB_REGEX" '
+                [.jobs[] | select(.name | test($regex))] as $tasks |
+                [($tasks|length), ($tasks|map(select(.status == "completed"))|length)] | @tsv' <<< "$jobs_json"
+            )
+            all_jobs_done=false
+            if (( observed_jobs > 0 && completed_jobs == observed_jobs )); then all_jobs_done=true; fi
+            echo "RUNNER_PROGRESS task_jobs=${observed_jobs} task_jobs_completed=${completed_jobs}"
+            if [[ "$all_jobs_done" == true ]]; then
+              # Artifact indexing can trail job completion briefly. Refresh once
+              # after a grace period before classifying missing receipts as infra.
+              sleep 10
+              refresh_artifacts || echo "::warning::Final progress artifact refresh failed"
+              render_snapshot true
+              finalized=true
+              break
             fi
-            sleep "$POLL_SECONDS"
+            render_snapshot false
+            sleep "${POLL_SECONDS:-30}"
           done
 
-          read -r observed completed success failed infra_timeout cancelled in_progress queued <<< "$final_stats"
-          total="$expected"
-          if (( total == 0 )); then total="$observed"; fi
-          remaining=$(( total - completed )); (( remaining < 0 )) && remaining=0
+          if [[ "$finalized" != true ]]; then
+            echo "::warning::Progress monitor reached its timeout; unreported tasks remain unclassified"
+          fi
           {
-            echo "## Task progress"
+            echo "## Official verifier task progress"
             echo
             echo "| Metric | Count |"
             echo "|---|---:|"
-            echo "| Total tasks | ${total} |"
-            echo "| Completed | ${completed} |"
-            echo "| Successful task jobs | ${success} |"
-            echo "| Failed task jobs | ${failed} |"
-            echo "| Infrastructure timeouts | ${infra_timeout} |"
-            echo "| Cancelled task jobs | ${cancelled} |"
-            echo "| In progress | ${in_progress} |"
-            echo "| Queued | ${queued} |"
-            echo "| Remaining | ${remaining} |"
+            jq -r '"| Total tasks | \(.total) |\n| Completed | \(.completed) |\n| Passed (official reward 1) | \(.passed) |\n| Failed (official reward 0) | \(.verifier_failed) |\n| Failed due to infrastructure | \(.infrastructure_failed) |\n| Tasks left | \(.remaining) |"' "$snapshot"
+            echo
+            echo "A task is counted as passed or failed only when an official verifier reward is present."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo >> "$GITHUB_STEP_SUMMARY"
-          echo "### Checkpoints (every ${checkpoint_every} completed tasks)" >> "$GITHUB_STEP_SUMMARY"
-          echo '```jsonl' >> "$GITHUB_STEP_SUMMARY"
-          cat "$checkpoints_file" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload durable progress checkpoints
+
+      - name: Upload progress ledger
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: task-progress-${{ github.run_id }}
-          path: ${{ runner.temp }}/task_progress_checkpoints.jsonl
+          name: official-progress-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/benchmark-progress-snapshot.json
+            ${{ runner.temp }}/benchmark-progress-checkpoints.jsonl
           if-no-files-found: error
