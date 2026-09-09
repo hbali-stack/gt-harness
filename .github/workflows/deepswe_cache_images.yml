@@ -26,6 +26,16 @@ on:
         type: string
         required: true
         default: "5"
+      destination_package:
+        description: "GHCR package name (use a fresh package when an older package has incompatible permissions)"
+        type: string
+        required: true
+        default: "deepswe-v1-1"
+      image_override:
+        description: "Optional single source image for registry diagnostics or repair"
+        type: string
+        required: false
+        default: ""
 
 jobs:
   prepare:
@@ -54,8 +64,9 @@ jobs:
           import json, os, sys, tomllib
           from pathlib import Path
 
-          images = set()
-          for toml_path in sorted(Path("deepswe-bench/tasks").glob("*/task.toml")):
+          override = "${{ inputs.image_override }}".strip()
+          images = {override} if override else set()
+          for toml_path in ([] if override else sorted(Path("deepswe-bench/tasks").glob("*/task.toml"))):
               with toml_path.open("rb") as handle:
                   data = tomllib.load(handle)
               found = None
@@ -113,6 +124,7 @@ jobs:
         env:
           IMAGES: ${{ matrix.images }}
           GHCR_PREFIX: ghcr.io/${{ github.repository_owner }}
+          DESTINATION_PACKAGE: ${{ inputs.destination_package }}
         run: |
           set -uo pipefail
           IFS=',' read -ra IMAGE_ARRAY <<< "$IMAGES"
@@ -129,10 +141,9 @@ jobs:
 
           for SRC in "${IMAGE_ARRAY[@]}"; do
             COUNT=$((COUNT + 1))
-            # public.ecr.aws/d3j8x8q7/swe-bench-202605:<tag> -> <repo>:<tag>
-            REPO_AND_TAG="${SRC##*/}"
-            DST="${GHCR_PREFIX}/${REPO_AND_TAG}"
-            echo "=== [$COUNT/$TOTAL] $REPO_AND_TAG ==="
+            TAG="${SRC##*:}"
+            DST="${GHCR_PREFIX}/${DESTINATION_PACKAGE}:${TAG}"
+            echo "=== [$COUNT/$TOTAL] ${DESTINATION_PACKAGE}:${TAG} ==="
 
             if docker manifest inspect "$DST" >/dev/null 2>&1; then
               echo "  already in GHCR, skipping"; CACHED=$((CACHED + 1)); continue
@@ -155,6 +166,6 @@ jobs:
             echo "total=$TOTAL already=$CACHED failed=$FAILED new=$((TOTAL - CACHED - FAILED))"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$FAILED" -eq "$TOTAL" ]; then
-            echo "::error::every image in this batch failed"; exit 1
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::$FAILED of $TOTAL images failed"; exit 1
           fi
