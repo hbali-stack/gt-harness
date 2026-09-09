@@ -429,6 +429,23 @@ jobs:
           docker load -i "${{ runner.temp }}/tb2-img.tar.gz"
           echo "loaded task image from cache for ${{ matrix.task }}"
 
+      - name: Pull task image before agent execution on cache miss
+        if: steps.restore.outputs.cache-hit != 'true'
+        env:
+          TASK: ${{ matrix.task }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          image="alexgshaw/${TASK}:${IMAGE_TAG}"
+          docker pull "$image"
+          docker image inspect "$image" >/dev/null
+
+      - name: Require the task image before Harbor starts
+        env:
+          TASK: ${{ matrix.task }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: docker image inspect "alexgshaw/${TASK}:${IMAGE_TAG}" >/dev/null
+
       - name: Resolve Harbor's exact task-owned agent budget
         env:
           DATASET: ${{ inputs.dataset }}

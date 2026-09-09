@@ -109,3 +109,5 @@ def test_tb2_workflow_publishes_harbor_verifier_receipts_to_live_monitor() -> No
     assert "expected_tasks_json: ${{ needs.plan.outputs.tasks }}" in workflow
     assert "Passed (official reward 1)" in monitor
     assert "Successful task jobs" not in monitor
+    assert workflow.index("Pull task image before agent execution on cache miss") < workflow.index("Run harbor - task")
+    assert workflow.index("Require the task image before Harbor starts") < workflow.index("Run harbor - task")
