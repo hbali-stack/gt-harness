@@ -84,6 +84,7 @@ on:
 permissions:
   contents: read
   actions: read
+  packages: read
 
 jobs:
   resolve:
@@ -436,9 +437,13 @@ jobs:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           set -euo pipefail
-          image="alexgshaw/${TASK}:${IMAGE_TAG}"
-          docker pull "$image"
-          docker image inspect "$image" >/dev/null
+          mirror="ghcr.io/${{ github.repository_owner }}/tb2.${TASK}:${IMAGE_TAG}"
+          canonical="alexgshaw/${TASK}:${IMAGE_TAG}"
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          docker pull "$mirror"
+          docker tag "$mirror" "$canonical"
+          docker image inspect "$canonical" >/dev/null
 
       - name: Require the task image before Harbor starts
         env:
