@@ -1,0 +1,486 @@
+name: "TB2 GT smoke20: Union Alpha on 921bec20"
+run-name: "TB2-GT smoke20 | stealth/union-alpha | 921bec20 | p20"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+env:
+  TREATMENT_SHA: 921bec20d3dbabd12e4b442936d9259c24cdcc74
+  MODEL: stealth/union-alpha
+  DATASET: terminal-bench@2.0
+  IMAGE_TAG: "20251031"
+  TIMEOUT_MULTIPLIER: "5.0"
+  STEP_LIMIT: "100"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      tasks: ${{ steps.plan.outputs.tasks }}
+      task_set_sha256: ${{ steps.plan.outputs.task_set_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TREATMENT_SHA }}
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the official Harbor planner
+        run: python -m pip install --disable-pip-version-check "harbor==0.20.0"
+
+      - name: Freeze the canonical repair20 matrix and task budgets
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TREATMENT_SHA"
+          harbor dataset download "$DATASET" -o "$RUNNER_TEMP/tb2-plan" --export
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          from scripts.resolve_harbor_budget import SUPERVISOR_GRACE_SECONDS, resolve_budget
+
+          tasks = [
+              "extract-elf", "mcmc-sampling-stan", "prove-plus-comm",
+              "qemu-alpine-ssh", "regex-chess", "sanitize-git-repo",
+              "torch-tensor-parallelism", "video-processing",
+              "winning-avg-corewars", "write-compressor", "headless-terminal",
+              "portfolio-optimization", "schemelike-metacircular-eval",
+              "cobol-modernization", "llm-inference-batching-scheduler",
+              "fix-code-vulnerability", "feal-linear-cryptanalysis",
+              "count-dataset-tokens", "largest-eigenval",
+              "torch-pipeline-parallelism",
+          ]
+          expected_hash = "36d5c8945f6f8d9ae23fe2cea759f16da0c0cea424a98f710cfaa0d9d6fd0303"
+          digest = hashlib.sha256(("\n".join(sorted(tasks)) + "\n").encode()).hexdigest()
+          if digest != expected_hash or len(tasks) != 20 or len(set(tasks)) != 20:
+              raise SystemExit("repair20 task identity mismatch")
+          dataset = Path(os.environ["RUNNER_TEMP"]) / "tb2-plan" / "terminal-bench"
+          available = {p.name for p in dataset.iterdir() if p.is_dir()}
+          missing = sorted(set(tasks) - available)
+          if missing:
+              raise SystemExit(f"tasks absent from terminal-bench@2.0: {missing}")
+          rows = []
+          for ordinal, task in enumerate(tasks, 1):
+              budget = resolve_budget(dataset / task / "task.toml", multiplier=5.0)
+              rows.append({
+                  "ordinal": ordinal,
+                  "task": task,
+                  "time_budget_seconds": max(
+                      30,
+                      int(float(budget["execution_budget_sec"]) - float(SUPERVISOR_GRACE_SECONDS)),
+                  ),
+                  "task_config_sha256": budget["task_config_sha256"],
+              })
+          receipt = {
+              "schema": "gt.tb2_gt_smoke20_plan.v1",
+              "treatment_sha": os.environ["TREATMENT_SHA"],
+              "model": os.environ["MODEL"],
+              "effective_model": "openai/stealth/union-alpha",
+              "dataset": os.environ["DATASET"],
+              "task_count": 20,
+              "task_ids": tasks,
+              "task_set_sha256": digest,
+              "parallel": 20,
+              "attempts_per_task": 1,
+              "agent": "eval.miniswe_agent:MiniSweGtAgent",
+              "agent_scaffold": "mini-swe-agent",
+              "agent_scaffold_version": "2.4.6",
+              "timeout_multiplier": 5.0,
+              "step_limit": 100,
+              "validation_run": True,
+              "matrix": rows,
+          }
+          Path("tb2-gt-smoke20-plan.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          matrix = json.dumps({"include": rows}, separators=(",", ":"))
+          tasks_json = json.dumps(tasks, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"matrix={matrix}\n")
+              out.write(f"tasks={tasks_json}\n")
+              out.write(f"task_set_sha256={digest}\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tb2-gt-smoke20-plan-${{ github.run_id }}
+          path: tb2-gt-smoke20-plan.json
+          if-no-files-found: error
+
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      TASK: ${{ matrix.task }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_NEW }}
+      OPENAI_API_KEY: ${{ secrets.OPENROUTER_NEW }}
+      OPENAI_BASE_URL: https://openrouter.ai/api/v1
+      GT_RETRIEVAL_MODE: hybrid_required
+      GT_TREATMENT: groundtruth
+      GT_JOURNAL_TEE: "1"
+      MINISWE_AGENT_VERSION: "2.4.6"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TREATMENT_SHA }}
+          fetch-depth: 1
+
+      - name: Prove exact treatment source
+        run: test "$(git rev-parse HEAD)" = "$TREATMENT_SHA"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+
+      - name: Install the locked GT product and official Harbor runtime
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            --require-hashes -r config/product-requirements.lock
+          test "$(python -c 'import importlib.metadata as m; print(m.version("mini-swe-agent"))')" = "2.4.6"
+          test "$(python -c 'import importlib.metadata as m; print(m.version("harbor"))')" = "0.20.0"
+
+      - name: Restore the existing TB2 task image cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/tb2-img.tar.gz
+          key: tb2-img-${{ matrix.task }}-${{ env.IMAGE_TAG }}
+
+      - name: Load the cached task image
+        if: steps.restore.outputs.cache-hit == 'true'
+        run: docker load -i "${{ runner.temp }}/tb2-img.tar.gz"
+
+      - name: Pull the existing GHCR mirror only on cache miss
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mirror="ghcr.io/${{ github.repository_owner }}/tb2.${TASK}:${IMAGE_TAG}"
+          canonical="alexgshaw/${TASK}:${IMAGE_TAG}"
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            --username "${{ github.actor }}" --password-stdin
+          docker pull "$mirror"
+          docker tag "$mirror" "$canonical"
+
+      - name: Require the exact task image before paid execution
+        run: docker image inspect "alexgshaw/${TASK}:${IMAGE_TAG}" >/dev/null
+
+      - name: Stage the verified uv installer
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/uv-install-0.11.32.tar.gz"
+          curl -fsSL -o "$installer" \
+            https://releases.astral.sh/github/uv/releases/download/0.11.32/uv-x86_64-unknown-linux-gnu.tar.gz
+          echo "aab924fd522efd06f1c5f3b93a243864fc453132c94b2dc49f1371b528a4b967  $installer" | sha256sum -c -
+          echo "GT_UV_INSTALLER_HOST=$installer" >> "$GITHUB_ENV"
+
+      - name: Stage the verified Python runtime
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cpython-3.12.13-20260718.tar.gz"
+          curl -fsSL -o "$archive" \
+            'https://github.com/astral-sh/python-build-standalone/releases/download/20260718/cpython-3.12.13%2B20260718-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz'
+          echo "5854aa6ec71cad00334d5065633c210b2e7feb40956767a59a91791cadcf0b79  $archive" | sha256sum -c -
+          echo "GT_PYTHON_ARCHIVE_HOST=$archive" >> "$GITHUB_ENV"
+
+      - name: Stage the pinned task dependency wheelhouse
+        run: |
+          set -euo pipefail
+          wheelhouse="$RUNNER_TEMP/gt-wheelhouse"
+          mkdir -p "$wheelhouse"
+          python -m pip download --only-binary=:all: --dest "$wheelhouse" \
+            "mini-swe-agent==2.4.6" "numpy==2.5.1" \
+            "onnxruntime==1.20.1" "tokenizers==0.23.1" \
+            "anthropic==0.120.2" "openai==2.50.0" \
+            "pydantic==2.13.4" "rich==15.0.0" \
+            "mcp==1.27.1" "structlog==25.5.0"
+          test -n "$(find "$wheelhouse" -type f -print -quit)"
+          echo "GT_WHEELHOUSE_HOST=$wheelhouse" >> "$GITHUB_ENV"
+
+      - name: Build and stage the exact treatment bundle
+        env:
+          BUNDLE_DIR: ${{ runner.temp }}/gt-treatment-bundle
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from gt_harness.product import build_product_bundle
+          root = Path.cwd()
+          output = Path(os.environ["BUNDLE_DIR"])
+          bundle = build_product_bundle(
+              root / "config/deepswe_product_bundle_v1.json", output_dir=output
+          )
+          wheel = output / "dist" / bundle["python_wheel"]["filename"]
+          records = {
+              "GT_GROUNDTRUTH_WHEEL_HOST": root / bundle["groundtruth"]["wheel_path"],
+              "GT_INDEX_BINARY_HOST": root / bundle["groundtruth"]["producer_path"],
+              "GT_HARNESS_WHEEL_HOST": wheel,
+              "GT_HARNESS_WHEEL_SHA256": bundle["python_wheel"]["sha256"],
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as out:
+              for name, value in records.items():
+                  out.write(f"{name}={value}\n")
+          PY
+          test -s "$BUNDLE_DIR/product-bundle.json"
+
+      - name: Provision the pinned local retrieval model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          model_dir="$RUNNER_TEMP/snowflake-arctic-embed-m"
+          mkdir -p "$model_dir"
+          gh release download gt-retrieval-runtime-v1 \
+            --repo harneet2512/gt-harness \
+            --pattern model.onnx --pattern tokenizer.json --pattern manifest.json \
+            --dir "$model_dir"
+          echo "564e6c65ee0c739a486702e9e3e9b33c3f697c19c34dbe886bce9eec497ce971  $model_dir/model.onnx" | sha256sum -c -
+          echo "91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854  $model_dir/tokenizer.json" | sha256sum -c -
+          echo "GT_DENSE_MODEL_DIR=$model_dir" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Stage pinned language servers
+        run: |
+          set -euo pipefail
+          lsp_bin="$RUNNER_TEMP/lsp-bin"
+          mkdir -p "$lsp_bin"
+          GOBIN="$lsp_bin" go install golang.org/x/tools/gopls@v0.23.0
+          ra_gz="$RUNNER_TEMP/rust-analyzer.gz"
+          curl -fsSL -o "$ra_gz" \
+            https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-31/rust-analyzer-x86_64-unknown-linux-gnu.gz
+          echo "a775f9edb543bb0c077da339b783e89446092986cde921c9d8e1733b091080c6  $ra_gz" | sha256sum -c -
+          gunzip -c "$ra_gz" > "$lsp_bin/rust-analyzer"
+          chmod 755 "$lsp_bin"/*
+          node_tar="$RUNNER_TEMP/node.tar.xz"
+          curl -fsSL -o "$node_tar" https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-x64.tar.xz
+          echo "2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2  $node_tar" | sha256sum -c -
+          node_root="$lsp_bin/node-runtime"
+          mkdir -p "$node_root"
+          tar -xJf "$node_tar" -C "$node_root" --strip-components=1
+          "$node_root/bin/npm" install --prefix "$node_root/servers" --no-fund --no-audit \
+            pyright@1.1.413 typescript-language-server@6.0.0 typescript@5.9.3
+          printf '#!/bin/sh\nexec "%s/bin/node" "%s/servers/node_modules/%s" "$@"\n' \
+            "/installed-agent/lsp-bin/node-runtime" "/installed-agent/lsp-bin/node-runtime" \
+            "pyright/langserver.index.js" > "$lsp_bin/pyright-langserver"
+          printf '#!/bin/sh\nexec "%s/bin/node" "%s/servers/node_modules/%s" "$@"\n' \
+            "/installed-agent/lsp-bin/node-runtime" "/installed-agent/lsp-bin/node-runtime" \
+            "typescript-language-server/lib/cli.mjs" > "$lsp_bin/typescript-language-server"
+          chmod 755 "$lsp_bin/pyright-langserver" "$lsp_bin/typescript-language-server"
+          find "$node_root" -type l -delete
+          python -m gt_harness.lsp_assets --root "$lsp_bin" --write
+          echo "GT_LSP_BIN_HOST=$lsp_bin" >> "$GITHUB_ENV"
+
+      - name: Mint the host-only resource attestation key
+        run: |
+          python - <<'PY'
+          import os, secrets
+          key = secrets.token_hex(32)
+          print(f"::add-mask::{key}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              out.write(f"GT_RESOURCE_ATTESTATION_KEY={key}\n")
+          PY
+
+      - name: Sanitize the OpenRouter key
+        run: |
+          python - <<'PY'
+          import os, sys
+          for name in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+              raw = os.environ.get(name, "")
+              clean = raw.replace("\ufeff", "").strip()
+              if not clean or not clean.isascii():
+                  raise SystemExit(f"{name} is missing or invalid")
+              print(f"::add-mask::{clean}")
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+                  out.write(f"{name}={clean}\n")
+          PY
+
+      - name: Run one official Harbor TB2 trial
+        id: harbor
+        shell: bash
+        run: |
+          set +e
+          mkdir -p results/terminal-bench
+          harbor run \
+            -d "$DATASET" \
+            --agent-import-path eval.miniswe_agent:MiniSweGtAgent \
+            -m "$MODEL" \
+            -o results/terminal-bench \
+            --job-name "tb2-gt-smoke20-921bec20-${GITHUB_RUN_ID}-${TASK}" \
+            --agent-timeout-multiplier "$TIMEOUT_MULTIPLIER" \
+            -n 1 -l 1 --delete -y \
+            --ak task_id="$TASK" \
+            --ak product_source_sha="$TREATMENT_SHA" \
+            --ak max_iterations="$STEP_LIMIT" \
+            --ak time_budget_seconds="${{ matrix.time_budget_seconds }}" \
+            -i "$TASK"
+          rc=$?
+          echo "$rc" > harbor-exit-code.txt
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Normalize artifact permissions
+        if: always()
+        run: sudo find results -type f -exec chmod a+r {} + 2>/dev/null || true
+
+      - name: Emit official-verifier progress receipt
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          task_id = os.environ["TASK"]
+          root = Path("results/terminal-bench")
+          matches = []
+          for path in sorted(root.rglob("result.json")) if root.exists() else []:
+              try:
+                  trial = json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  continue
+              runner_task = str(trial.get("task_name") or "").rsplit("/", 1)[-1]
+              if runner_task == task_id and trial.get("trial_name"):
+                  matches.append((path, trial))
+          reward = None
+          source = ""
+          if len(matches) == 1:
+              path, trial = matches[0]
+              verifier = trial.get("verifier_result")
+              rewards = verifier.get("rewards") if isinstance(verifier, dict) else None
+              value = rewards.get("reward") if isinstance(rewards, dict) else None
+              if type(value) in (int, float) and value in (0, 1):
+                  reward, source = int(value), "harbor_verifier_result"
+              else:
+                  timing = trial.get("verifier")
+                  reward_path = path.parent / "verifier" / "reward.txt"
+                  ctrf_path = path.parent / "verifier" / "ctrf.json"
+                  if (isinstance(timing, dict) and timing.get("started_at") and
+                      timing.get("finished_at") and reward_path.is_file() and ctrf_path.is_file()):
+                      try:
+                          candidate = float(reward_path.read_text().strip())
+                          ctrf = json.loads(ctrf_path.read_text())
+                          summary = ((ctrf.get("results") or {}).get("summary") or {})
+                          if candidate in (0.0, 1.0) and isinstance(summary, dict) and summary:
+                              reward, source = int(candidate), "official_verifier_artifact"
+                      except Exception:
+                          pass
+          if reward is None:
+              row = {
+                  "task_id": task_id, "state": "infrastructure_failed",
+                  "official_verifier": False, "reward": None,
+                  "failure_class": "missing_result" if not matches else "missing_verifier",
+                  "error_code": "official_verifier_reward_missing",
+              }
+          else:
+              row = {
+                  "task_id": task_id,
+                  "state": "passed" if reward == 1 else "verifier_failed",
+                  "official_verifier": True, "reward": reward,
+                  "reward_source": source, "failure_class": "graded", "error_code": "",
+              }
+          receipt = {
+              "schema": "gt.benchmark_progress.v1",
+              "benchmark_suite": "terminal-bench-2",
+              "model": os.environ["MODEL"],
+              "effective_model": "openai/stealth/union-alpha",
+              "treatment_sha": os.environ["TREATMENT_SHA"],
+              "tasks": [row],
+          }
+          Path("benchmark-progress.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-progress-tb2-gt-${{ github.run_id }}-${{ matrix.task }}
+          path: benchmark-progress.json
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tb2-gt-smoke20-921bec20-${{ github.run_id }}-task-${{ matrix.task }}
+          path: |
+            results/terminal-bench/
+            harbor-exit-code.txt
+            ${{ runner.temp }}/gt-treatment-bundle/product-bundle.json
+          if-no-files-found: warn
+
+  summarize:
+    if: always()
+    needs: [plan, run]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-progress-tb2-gt-${{ github.run_id }}-*
+          path: receipts
+          merge-multiple: false
+
+      - name: Aggregate the 20 official-verifier receipts
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          rows = []
+          for path in sorted(Path("receipts").rglob("benchmark-progress.json")):
+              data = json.loads(path.read_text(encoding="utf-8"))
+              if data.get("schema") != "gt.benchmark_progress.v1":
+                  raise SystemExit(f"invalid schema: {path}")
+              rows.extend(data.get("tasks") or [])
+          counts = Counter(row.get("state") for row in rows)
+          out = {
+              "schema": "gt.tb2_gt_smoke20_summary.v1",
+              "model": "stealth/union-alpha",
+              "effective_model": "openai/stealth/union-alpha",
+              "treatment_sha": "921bec20d3dbabd12e4b442936d9259c24cdcc74",
+              "completed": len(rows), "left": 20 - len(rows),
+              "success": counts["passed"],
+              "incorrect": counts["verifier_failed"],
+              "infrastructure": counts["infrastructure_failed"],
+              "unique_tasks": len({row.get("task_id") for row in rows}),
+              "tasks": rows,
+          }
+          Path("tb2-gt-smoke20-summary.json").write_text(
+              json.dumps(out, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(out, sort_keys=True))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tb2-gt-smoke20-921bec20-${{ github.run_id }}-SUMMARY
+          path: tb2-gt-smoke20-summary.json
+          if-no-files-found: error
