@@ -1,0 +1,105 @@
+# GT-on mini run: SWE-Live Lite, 20 fixed tasks, 5 at a time.
+#
+# Stage first5 runs the first five tasks. Stage rest15 runs the other fifteen
+# and refuses to start unless first5_run_id names a SUCCESSFUL first5 run of
+# this same workflow in this repository - "only if those 5 go". Parallelism is
+# 5 so the run fits beside other work on the account's runner pool. The
+# certified pipeline does the work; this file owns the task set and the gate.
+# GT-on only: there is no GT-off arm here or in the called pipeline.
+name: "GT mini SWE-Live Lite (20 tasks, 5 parallel)"
+run-name: "GT mini SWE-Live Lite | ${{ inputs.stage }} | ${{ inputs.model }} | ${{ inputs.gt_delivery_mode }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "first5, then rest15 once first5 succeeded"
+        required: true
+        type: choice
+        options: [first5, rest15]
+        default: first5
+      first5_run_id:
+        description: "rest15 only: the successful first5 run of this workflow"
+        required: false
+        type: string
+        default: ""
+      model:
+        description: "OpenRouter model id chosen at launch (bare id, e.g. stealth/space-bunny-alpha)"
+        required: true
+        type: string
+      gt_delivery_mode:
+        description: "GT delivery (both are GT-on)"
+        required: true
+        type: choice
+        options: [attached, push]
+        default: attached
+      reasoning_effort:
+        description: "minimal|low|medium|high|xhigh|max; empty = not sent"
+        required: false
+        type: string
+        default: ""
+      step_limit:
+        description: "Agent step limit"
+        required: false
+        type: string
+        default: "0"
+      approve_paid_run:
+        description: "Explicit approval for provider requests (required even at $0)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+  actions: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tasks: ${{ steps.tasks.outputs.tasks }}
+    steps:
+      - name: Resolve the stage's tasks and enforce the first5 gate
+        id: tasks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE: ${{ inputs.stage }}
+          FIRST5_RUN_ID: ${{ inputs.first5_run_id }}
+          WORKFLOW_PATH: .github/workflows/gt_mini_swelive.yml
+        run: |
+          set -euo pipefail
+          FIRST5="aiogram__aiogram-1594,amoffat__sh-744,arviz-devs__arviz-2413,aws-cloudformation__cfn-lint-3749,beancount__beancount-931"
+          REST15="beetbox__beets-5457,beeware__briefcase-2075,bridgecrewio__checkov-6893,conan-io__conan-17092,cyclotruc__gitingest-115,deepset-ai__haystack-8489,delgan__loguru-1297,dynaconf__dynaconf-1225,encode__starlette-2812,facebookresearch__hydra-3005,falconry__falcon-2366,feast-dev__feast-5036,flexget__flexget-4244,fonttools__fonttools-3682,geopandas__geopandas-3471"
+          if [ "$STAGE" = first5 ]; then
+            echo "tasks=$FIRST5" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s' "$FIRST5_RUN_ID" | grep -Eq '^[0-9]+$'; then
+            echo "::error title=Gate::rest15 needs first5_run_id (a successful first5 run)"; exit 1
+          fi
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$FIRST5_RUN_ID")"
+          path="$(printf '%s' "$run" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')"
+          conclusion="$(printf '%s' "$run" | python3 -c 'import json,sys; print(json.load(sys.stdin)["conclusion"])')"
+          title="$(printf '%s' "$run" | python3 -c 'import json,sys; print(json.load(sys.stdin)["display_title"])')"
+          case "$path" in "$WORKFLOW_PATH"*) ;; *) echo "::error title=Gate::run $FIRST5_RUN_ID is $path, not $WORKFLOW_PATH"; exit 1;; esac
+          case "$title" in *"| first5 |"*) ;; *) echo "::error title=Gate::run $FIRST5_RUN_ID is not a first5 run: $title"; exit 1;; esac
+          if [ "$conclusion" != success ]; then
+            echo "::error title=Gate::first5 run $FIRST5_RUN_ID concluded $conclusion; rest15 runs only after first5 goes"; exit 1
+          fi
+          echo "tasks=$REST15" >> "$GITHUB_OUTPUT"
+
+  gt_on:
+    needs: gate
+    uses: ./.github/workflows/swelive_gt_harness_paid.yaml
+    secrets: inherit
+    with:
+      approve_paid_run: ${{ inputs.approve_paid_run }}
+      cohort_stage: subset
+      single_task_id: ${{ needs.gate.outputs.tasks }}
+      model: ${{ inputs.model }}
+      gt_delivery_mode: ${{ inputs.gt_delivery_mode }}
+      reasoning_effort: ${{ inputs.reasoning_effort }}
+      step_limit: ${{ inputs.step_limit }}
+      max_parallel: "5"
