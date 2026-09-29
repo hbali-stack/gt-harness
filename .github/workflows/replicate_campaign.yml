@@ -1,52 +1,36 @@
-# Replicate campaign: GT and baseline arms of DeepSWE and TB2, run entirely on GitHub.
+# Replicate campaign: an ordered queue of replicates for ONE account, run strictly one at a time.
 #
-# One dispatch per account. Each replicate is a (rep, arm) pair; GT and baseline of the
-# same rep start together (max-parallel 2, parallel_per_arm jobs each), so both arms see
-# the same time window, runner pool and provider conditions. The next replicate starts
-# as soon as either arm of the current one finishes, which fills the tail of the other.
-# TB2 replicates start after the DeepSWE ones on the same account. Tasks run
-# longest-first (config/replicate_task_order.json) so long jobs never form the tail.
+# Each queue entry is one replicate (benchmark, arm, rep) run at `parallel` (default 20 = the
+# account's whole runner pool), so each replicate finishes as fast as the account allows and
+# the next starts when it is done. TB2 entries run first, then DeepSWE entries, each in the
+# order given. An entry may carry its own task list (the tasks still missing from a replicate
+# that was interrupted); otherwise it runs the full longest-first order
+# (config/replicate_task_order.json).
 #
 # The baseline arm is GT-off: dispatch only on the user's explicit instruction
 # (standing rule), which confirm_baseline records.
 name: Replicate campaign (DeepSWE + TB2, GT and baseline)
-run-name: Replicates dsw gt=${{ inputs.deepswe_gt_reps }} base=${{ inputs.deepswe_baseline_reps }} tb2 gt=${{ inputs.tb2_gt_reps }} base=${{ inputs.tb2_baseline_reps }}
+run-name: Replicates ${{ inputs.label }}
 
 on:
   workflow_dispatch:
     inputs:
-      deepswe_gt_reps:
-        description: 'JSON list of DeepSWE GT replicate numbers, e.g. [3] ([] for none)'
+      queue:
+        description: 'JSON list of {"bench":"deepswe|tb2","arm":"gt|baseline","rep":N,"tasks":[...optional]}, run one at a time'
         required: true
         default: "[]"
-      deepswe_baseline_reps:
-        description: 'JSON list of DeepSWE baseline replicate numbers, e.g. [2,3] ([] for none)'
-        required: true
-        default: "[]"
-      tb2_gt_reps:
-        description: 'JSON list of TB2 GT replicate numbers ([] for none)'
-        required: true
-        default: "[]"
-      tb2_baseline_reps:
-        description: 'JSON list of TB2 baseline replicate numbers ([] for none)'
-        required: true
-        default: "[]"
+      label:
+        description: Short run label (shown in the run name)
+        required: false
+        default: ""
       model:
         description: Model id (OpenRouter)
         required: true
         default: stealth/space-bunny-alpha
-      parallel_per_arm:
-        description: Concurrent task jobs per arm (two arms run together)
+      parallel:
+        description: Concurrent task jobs for the replicate being run (20 = the whole account)
         required: true
-        default: "10"
-      deepswe_tasks_override:
-        description: 'Canary only: JSON list of DeepSWE tasks instead of the full ordered set ("" = all)'
-        required: false
-        default: ""
-      tb2_tasks_override:
-        description: 'Canary only: JSON list of TB2 tasks instead of the full ordered set ("" = all)'
-        required: false
-        default: ""
+        default: "20"
       confirm_baseline:
         description: 'Type "user-approved" - the user explicitly instructed GT-off baseline runs'
         required: true
@@ -62,91 +46,72 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      deepswe_tasks: ${{ steps.order.outputs.deepswe_tasks }}
-      tb2_tasks: ${{ steps.order.outputs.tb2_tasks }}
-      deepswe_matrix: ${{ steps.order.outputs.deepswe_matrix }}
-      tb2_matrix: ${{ steps.order.outputs.tb2_matrix }}
+      deepswe: ${{ steps.order.outputs.deepswe }}
+      tb2: ${{ steps.order.outputs.tb2 }}
     steps:
       - uses: actions/checkout@v4
       - id: order
         env:
-          DSW_GT: ${{ inputs.deepswe_gt_reps }}
-          DSW_BASE: ${{ inputs.deepswe_baseline_reps }}
-          TB2_GT: ${{ inputs.tb2_gt_reps }}
-          TB2_BASE: ${{ inputs.tb2_baseline_reps }}
+          QUEUE: ${{ inputs.queue }}
           CONFIRM: ${{ inputs.confirm_baseline }}
-          DSW_OVERRIDE: ${{ inputs.deepswe_tasks_override }}
-          TB2_OVERRIDE: ${{ inputs.tb2_tasks_override }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json, os
           order = json.load(open("config/replicate_task_order.json", encoding="utf-8"))
-          def reps(name):
-              value = json.loads(os.environ[name])
-              if not isinstance(value, list) or not all(isinstance(r, int) and r > 0 for r in value):
-                  raise SystemExit(f"{name} must be a JSON list of positive integers, got {value!r}")
-              return value
-          def matrix(gt_name, base_name):
-              gt, base = reps(gt_name), reps(base_name)
-              if base and os.environ["CONFIRM"] != "user-approved":
+          queue = json.loads(os.environ["QUEUE"])
+          cells = {"deepswe": [], "tb2": []}
+          for entry in queue:
+              bench, arm, rep = entry["bench"], entry["arm"], entry["rep"]
+              if bench not in cells or arm not in ("gt", "baseline") or not (isinstance(rep, int) and rep > 0):
+                  raise SystemExit(f"bad queue entry {entry!r}")
+              if arm == "baseline" and os.environ["CONFIRM"] != "user-approved":
                   raise SystemExit("baseline arm needs confirm_baseline=user-approved (user's explicit instruction)")
-              # Alternate the arms so GT and baseline replicates share time windows.
-              cells = []
-              for i in range(max(len(gt), len(base))):
-                  cells += [{"rep": str(gt[i]), "arm": "gt"}] if i < len(gt) else []
-                  cells += [{"rep": str(base[i]), "arm": "baseline"}] if i < len(base) else []
-              return cells
-          def tasks(bench, name):
               full = [t["task"] for t in order[bench]]
-              raw = os.environ[name].strip()
-              if not raw:
-                  return full
-              chosen = json.loads(raw)
-              unknown = [t for t in chosen if t not in full]
+              tasks = entry.get("tasks") or full
+              unknown = [t for t in tasks if t not in full]
               if unknown:
-                  raise SystemExit(f"{name}: tasks not in the {bench} order: {unknown}")
-              return chosen
+                  raise SystemExit(f"{bench} tasks not in the task order: {unknown}")
+              tasks = [t for t in full if t in set(tasks)]  # keep longest-first
+              cells[bench].append({"arm": arm, "rep": str(rep), "tasks": json.dumps(tasks), "n": len(tasks)})
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write("deepswe_tasks=" + json.dumps(tasks("deepswe", "DSW_OVERRIDE")) + "\n")
-              out.write("tb2_tasks=" + json.dumps(tasks("tb2", "TB2_OVERRIDE")) + "\n")
-              out.write("deepswe_matrix=" + json.dumps(matrix("DSW_GT", "DSW_BASE")) + "\n")
-              out.write("tb2_matrix=" + json.dumps(matrix("TB2_GT", "TB2_BASE")) + "\n")
-          print("deepswe", matrix("DSW_GT", "DSW_BASE"), "tb2", matrix("TB2_GT", "TB2_BASE"))
+              for bench, rows in cells.items():
+                  out.write(f"{bench}=" + json.dumps(rows) + "\n")
+                  print(bench, [(r["arm"], r["rep"], r["n"]) for r in rows])
           PY
 
-  deepswe:
+  tb2:
     needs: order
-    if: needs.order.outputs.deepswe_matrix != '[]'
+    if: needs.order.outputs.tb2 != '[]'
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
-        include: ${{ fromJSON(needs.order.outputs.deepswe_matrix) }}
-    uses: ./.github/workflows/deepswe_thin_gt.yml
+        include: ${{ fromJSON(needs.order.outputs.tb2) }}
+    uses: ./.github/workflows/tb2_thin_gt.yml
     with:
-      tasks: ${{ needs.order.outputs.deepswe_tasks }}
+      tasks: ${{ matrix.tasks }}
       model: ${{ inputs.model }}
-      step_limit: "300"
-      parallel: ${{ inputs.parallel_per_arm }}
+      parallel: ${{ inputs.parallel }}
       arm: ${{ matrix.arm }}
       rep: ${{ matrix.rep }}
       image_owner: harneet2512
     secrets: inherit
 
-  tb2:
-    needs: [order, deepswe]
-    if: always() && needs.order.result == 'success' && needs.order.outputs.tb2_matrix != '[]'
+  deepswe:
+    needs: [order, tb2]
+    if: always() && needs.order.result == 'success' && needs.order.outputs.deepswe != '[]'
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
-        include: ${{ fromJSON(needs.order.outputs.tb2_matrix) }}
-    uses: ./.github/workflows/tb2_thin_gt.yml
+        include: ${{ fromJSON(needs.order.outputs.deepswe) }}
+    uses: ./.github/workflows/deepswe_thin_gt.yml
     with:
-      tasks: ${{ needs.order.outputs.tb2_tasks }}
+      tasks: ${{ matrix.tasks }}
       model: ${{ inputs.model }}
-      parallel: ${{ inputs.parallel_per_arm }}
+      step_limit: "300"
+      parallel: ${{ inputs.parallel }}
       arm: ${{ matrix.arm }}
       rep: ${{ matrix.rep }}
       image_owner: harneet2512
