@@ -1,0 +1,136 @@
+# Replicate campaign: GT and baseline arms of DeepSWE and TB2, run entirely on GitHub.
+#
+# One dispatch per account. Each replicate is a (rep, arm) pair; GT and baseline of the
+# same rep start together (max-parallel 2, parallel_per_arm jobs each), so both arms see
+# the same time window, runner pool and provider conditions. The next replicate starts
+# as soon as either arm of the current one finishes, which fills the tail of the other.
+# TB2 replicates start after the DeepSWE ones on the same account. Tasks run
+# longest-first (config/replicate_task_order.json) so long jobs never form the tail.
+#
+# The baseline arm is GT-off: dispatch only on the user's explicit instruction
+# (standing rule), which confirm_baseline records.
+name: Replicate campaign (DeepSWE + TB2, GT and baseline)
+run-name: Replicates dsw=${{ inputs.deepswe_reps }} tb2=${{ inputs.tb2_reps }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deepswe_reps:
+        description: 'JSON list of DeepSWE replicate numbers for this account, e.g. [1,2] ([] for none)'
+        required: true
+        default: "[]"
+      tb2_reps:
+        description: 'JSON list of TB2 replicate numbers for this account, e.g. [1] ([] for none)'
+        required: true
+        default: "[]"
+      model:
+        description: Model id (OpenRouter)
+        required: true
+        default: stealth/space-bunny-alpha
+      parallel_per_arm:
+        description: Concurrent task jobs per arm (two arms run together)
+        required: true
+        default: "10"
+      deepswe_tasks_override:
+        description: 'Canary only: JSON list of DeepSWE tasks instead of the full ordered set ("" = all)'
+        required: false
+        default: ""
+      tb2_tasks_override:
+        description: 'Canary only: JSON list of TB2 tasks instead of the full ordered set ("" = all)'
+        required: false
+        default: ""
+      confirm_baseline:
+        description: 'Type "user-approved" - the user explicitly instructed GT-off baseline runs'
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      deepswe_tasks: ${{ steps.order.outputs.deepswe_tasks }}
+      tb2_tasks: ${{ steps.order.outputs.tb2_tasks }}
+      deepswe_matrix: ${{ steps.order.outputs.deepswe_matrix }}
+      tb2_matrix: ${{ steps.order.outputs.tb2_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: order
+        env:
+          DSW_REPS: ${{ inputs.deepswe_reps }}
+          TB2_REPS: ${{ inputs.tb2_reps }}
+          CONFIRM: ${{ inputs.confirm_baseline }}
+          DSW_OVERRIDE: ${{ inputs.deepswe_tasks_override }}
+          TB2_OVERRIDE: ${{ inputs.tb2_tasks_override }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          if os.environ["CONFIRM"] != "user-approved":
+              raise SystemExit("baseline arm needs confirm_baseline=user-approved (user's explicit instruction)")
+          order = json.load(open("config/replicate_task_order.json", encoding="utf-8"))
+          def reps(name):
+              value = json.loads(os.environ[name])
+              if not isinstance(value, list) or not all(isinstance(r, int) and r > 0 for r in value):
+                  raise SystemExit(f"{name} must be a JSON list of positive integers, got {value!r}")
+              # rep-major, GT then baseline: the two arms of one rep start together.
+              return [{"rep": str(r), "arm": arm} for r in value for arm in ("gt", "baseline")]
+          def tasks(bench, name):
+              full = [t["task"] for t in order[bench]]
+              raw = os.environ[name].strip()
+              if not raw:
+                  return full
+              chosen = json.loads(raw)
+              unknown = [t for t in chosen if t not in full]
+              if unknown:
+                  raise SystemExit(f"{name}: tasks not in the {bench} order: {unknown}")
+              return chosen
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("deepswe_tasks=" + json.dumps(tasks("deepswe", "DSW_OVERRIDE")) + "\n")
+              out.write("tb2_tasks=" + json.dumps(tasks("tb2", "TB2_OVERRIDE")) + "\n")
+              out.write("deepswe_matrix=" + json.dumps(reps("DSW_REPS")) + "\n")
+              out.write("tb2_matrix=" + json.dumps(reps("TB2_REPS")) + "\n")
+          print("deepswe", os.environ["DSW_REPS"], "tb2", os.environ["TB2_REPS"])
+          PY
+
+  deepswe:
+    needs: order
+    if: needs.order.outputs.deepswe_matrix != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.order.outputs.deepswe_matrix) }}
+    uses: ./.github/workflows/deepswe_thin_gt.yml
+    with:
+      tasks: ${{ needs.order.outputs.deepswe_tasks }}
+      model: ${{ inputs.model }}
+      step_limit: "300"
+      parallel: ${{ inputs.parallel_per_arm }}
+      arm: ${{ matrix.arm }}
+      rep: ${{ matrix.rep }}
+      image_owner: harneet2512
+    secrets: inherit
+
+  tb2:
+    needs: [order, deepswe]
+    if: always() && needs.order.result == 'success' && needs.order.outputs.tb2_matrix != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.order.outputs.tb2_matrix) }}
+    uses: ./.github/workflows/tb2_thin_gt.yml
+    with:
+      tasks: ${{ needs.order.outputs.tb2_tasks }}
+      model: ${{ inputs.model }}
+      parallel: ${{ inputs.parallel_per_arm }}
+      arm: ${{ matrix.arm }}
+      rep: ${{ matrix.rep }}
+      image_owner: harneet2512
+    secrets: inherit
