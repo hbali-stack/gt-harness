@@ -10,17 +10,25 @@
 # The baseline arm is GT-off: dispatch only on the user's explicit instruction
 # (standing rule), which confirm_baseline records.
 name: Replicate campaign (DeepSWE + TB2, GT and baseline)
-run-name: Replicates dsw=${{ inputs.deepswe_reps }} tb2=${{ inputs.tb2_reps }}
+run-name: Replicates dsw gt=${{ inputs.deepswe_gt_reps }} base=${{ inputs.deepswe_baseline_reps }} tb2 gt=${{ inputs.tb2_gt_reps }} base=${{ inputs.tb2_baseline_reps }}
 
 on:
   workflow_dispatch:
     inputs:
-      deepswe_reps:
-        description: 'JSON list of DeepSWE replicate numbers for this account, e.g. [1,2] ([] for none)'
+      deepswe_gt_reps:
+        description: 'JSON list of DeepSWE GT replicate numbers, e.g. [3] ([] for none)'
         required: true
         default: "[]"
-      tb2_reps:
-        description: 'JSON list of TB2 replicate numbers for this account, e.g. [1] ([] for none)'
+      deepswe_baseline_reps:
+        description: 'JSON list of DeepSWE baseline replicate numbers, e.g. [2,3] ([] for none)'
+        required: true
+        default: "[]"
+      tb2_gt_reps:
+        description: 'JSON list of TB2 GT replicate numbers ([] for none)'
+        required: true
+        default: "[]"
+      tb2_baseline_reps:
+        description: 'JSON list of TB2 baseline replicate numbers ([] for none)'
         required: true
         default: "[]"
       model:
@@ -62,8 +70,10 @@ jobs:
       - uses: actions/checkout@v4
       - id: order
         env:
-          DSW_REPS: ${{ inputs.deepswe_reps }}
-          TB2_REPS: ${{ inputs.tb2_reps }}
+          DSW_GT: ${{ inputs.deepswe_gt_reps }}
+          DSW_BASE: ${{ inputs.deepswe_baseline_reps }}
+          TB2_GT: ${{ inputs.tb2_gt_reps }}
+          TB2_BASE: ${{ inputs.tb2_baseline_reps }}
           CONFIRM: ${{ inputs.confirm_baseline }}
           DSW_OVERRIDE: ${{ inputs.deepswe_tasks_override }}
           TB2_OVERRIDE: ${{ inputs.tb2_tasks_override }}
@@ -71,15 +81,22 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json, os
-          if os.environ["CONFIRM"] != "user-approved":
-              raise SystemExit("baseline arm needs confirm_baseline=user-approved (user's explicit instruction)")
           order = json.load(open("config/replicate_task_order.json", encoding="utf-8"))
           def reps(name):
               value = json.loads(os.environ[name])
               if not isinstance(value, list) or not all(isinstance(r, int) and r > 0 for r in value):
                   raise SystemExit(f"{name} must be a JSON list of positive integers, got {value!r}")
-              # rep-major, GT then baseline: the two arms of one rep start together.
-              return [{"rep": str(r), "arm": arm} for r in value for arm in ("gt", "baseline")]
+              return value
+          def matrix(gt_name, base_name):
+              gt, base = reps(gt_name), reps(base_name)
+              if base and os.environ["CONFIRM"] != "user-approved":
+                  raise SystemExit("baseline arm needs confirm_baseline=user-approved (user's explicit instruction)")
+              # Alternate the arms so GT and baseline replicates share time windows.
+              cells = []
+              for i in range(max(len(gt), len(base))):
+                  cells += [{"rep": str(gt[i]), "arm": "gt"}] if i < len(gt) else []
+                  cells += [{"rep": str(base[i]), "arm": "baseline"}] if i < len(base) else []
+              return cells
           def tasks(bench, name):
               full = [t["task"] for t in order[bench]]
               raw = os.environ[name].strip()
@@ -93,9 +110,9 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write("deepswe_tasks=" + json.dumps(tasks("deepswe", "DSW_OVERRIDE")) + "\n")
               out.write("tb2_tasks=" + json.dumps(tasks("tb2", "TB2_OVERRIDE")) + "\n")
-              out.write("deepswe_matrix=" + json.dumps(reps("DSW_REPS")) + "\n")
-              out.write("tb2_matrix=" + json.dumps(reps("TB2_REPS")) + "\n")
-          print("deepswe", os.environ["DSW_REPS"], "tb2", os.environ["TB2_REPS"])
+              out.write("deepswe_matrix=" + json.dumps(matrix("DSW_GT", "DSW_BASE")) + "\n")
+              out.write("tb2_matrix=" + json.dumps(matrix("TB2_GT", "TB2_BASE")) + "\n")
+          print("deepswe", matrix("DSW_GT", "DSW_BASE"), "tb2", matrix("TB2_GT", "TB2_BASE"))
           PY
 
   deepswe:
